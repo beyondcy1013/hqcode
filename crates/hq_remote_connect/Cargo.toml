@@ -1,6 +1,6 @@
 [package]
 name = "hq_remote_connect"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "Parameterized endpoint discovery, one-time QR pairing tickets, and paired-device registry for self-hosted control planes."

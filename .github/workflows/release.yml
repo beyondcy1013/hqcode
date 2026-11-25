@@ -19,10 +19,10 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset_suffix: linux-aarch64
-          - os: macos-14
+          - os: macos-latest
             target: aarch64-apple-darwin
             asset_suffix: macos-aarch64
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             asset_suffix: macos-x86_64
     runs-on: ${{ matrix.os }}
@@ -41,8 +41,16 @@ jobs:
           mkdir -p "dist/${PKG}"
           cp "target/${{ matrix.target }}/release/hqcode" "dist/${PKG}/"
           cp README.md LICENSE "dist/${PKG}/"
+          if [ -f README.zh-CN.md ]; then
+            cp README.zh-CN.md "dist/${PKG}/"
+          fi
           tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
-          cd dist && sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
+          else
+            shasum -a 256 "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: hqcode-${{ matrix.asset_suffix }}

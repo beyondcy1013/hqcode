@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "hq_auth"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -509,7 +509,7 @@ dependencies = [
 
 [[package]]
 name = "hq_fs_atomic"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "libc",
@@ -521,7 +521,7 @@ dependencies = [
 
 [[package]]
 name = "hq_presets"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "hq_fs_atomic",
@@ -533,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "hq_remote_connect"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -548,7 +548,7 @@ dependencies = [
 
 [[package]]
 name = "hq_runtime_paths"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -557,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "hq_tmux"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "hq_fs_atomic",
@@ -573,7 +573,7 @@ dependencies = [
 
 [[package]]
 name = "hq_workspace"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "hq_fs_atomic",
@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "hqcode"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",

@@ -1266,7 +1266,7 @@ mod tests {
             RemoteConnectService::initialize(&data_dir, RemoteConnectConfig::for_app("hqcode"))
                 .unwrap();
         let state = AppState {
-            version: "0.1.0".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             started_at: Instant::now(),
             static_dir: PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/static")),
             workspace: Arc::new(RwLock::new(WorkspaceConfig::new(PathBuf::from("/tmp")))),
