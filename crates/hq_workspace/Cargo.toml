@@ -1,0 +1,15 @@
+[package]
+name = "hq_workspace"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+hq_fs_atomic = { path = "../hq_fs_atomic" }
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.44", features = ["fs", "io-util", "process", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.44", features = ["macros", "rt-multi-thread"] }

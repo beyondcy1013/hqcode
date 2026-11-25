@@ -1,0 +1,51 @@
+[package]
+name = "hqcode"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Self-hosted Rust control plane for persistent tmux Claude Code, Codex, and shell sessions."
+
+[workspace]
+members = [
+    "crates/hq_auth",
+    "crates/hq_fs_atomic",
+    "crates/hq_presets",
+    "crates/hq_runtime_paths",
+    "crates/hq_tmux",
+    "crates/hq_workspace",
+]
+
+[dependencies]
+anyhow = "1.0"
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
+hq_auth = { path = "crates/hq_auth" }
+hq_fs_atomic = { path = "crates/hq_fs_atomic" }
+hq_presets = { path = "crates/hq_presets" }
+hq_runtime_paths = { path = "crates/hq_runtime_paths" }
+hq_tmux = { path = "crates/hq_tmux" }
+hq_workspace = { path = "crates/hq_workspace" }
+include_dir = "0.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.11"
+tokio = { version = "1.44", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tower-http = { version = "0.6", features = ["compression-br", "compression-gzip", "set-header"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

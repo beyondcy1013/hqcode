@@ -1,0 +1,12 @@
+[package]
+name = "hq_runtime_paths"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+time = { version = "0.3", features = ["local-offset"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

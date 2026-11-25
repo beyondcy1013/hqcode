@@ -1,0 +1,902 @@
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+};
+
+use anyhow::{Context, Result};
+use axum::{
+    Json, Router,
+    body::Body,
+    extract::{
+        ConnectInfo, Path as AxumPath, Query, Request, State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
+    },
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Response},
+    routing::{delete, get, post, put},
+};
+use futures_util::{SinkExt, StreamExt};
+use hq_auth::{AuthConfig, AuthService};
+use hq_presets::{DetectedAgent, ModelPreset, PresetStore, apply_preset, detect_installed_agents};
+use hq_runtime_paths::resolve_current_user;
+use hq_tmux::{CreateSessionRequest, TerminalManager, TerminalStreamEvent, TmuxNamespace};
+use hq_workspace::{
+    WorkspaceConfig, git_commit, git_diff, git_revert_file, git_status, list_entries,
+    read_utf8_file, rename_entry, write_utf8_file,
+};
+use include_dir::{Dir, include_dir};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::net::TcpListener;
+use tower_http::compression::CompressionLayer;
+use tracing::{info, warn};
+
+static EMBEDDED_STATIC_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/static");
+const NO_STORE_CACHE: &str = "no-store, max-age=0, must-revalidate";
+const STATIC_CACHE: &str = "no-cache, must-revalidate";
+
+#[derive(Clone)]
+pub struct AppState {
+    pub version: String,
+    pub static_dir: PathBuf,
+    pub workspace: Arc<RwLock<WorkspaceConfig>>,
+    pub auth: AuthService,
+    pub terminal: TerminalManager,
+    pub presets: PresetStore,
+    pub user_home: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct AppError {
+    status: StatusCode,
+    message: String,
+}
+
+impl AppError {
+    fn bad_request(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: msg.into(),
+        }
+    }
+
+    fn unauthorized(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: msg.into(),
+        }
+    }
+
+    fn not_found(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: msg.into(),
+        }
+    }
+
+    fn internal(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: msg.into(),
+        }
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        (self.status, Json(serde_json::json!({ "error": self.message }))).into_response()
+    }
+}
+
+type ApiResult<T> = std::result::Result<T, AppError>;
+
+pub async fn serve(addr: SocketAddr, data_dir: PathBuf, workspace_dir: PathBuf) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "hqcode=info,tower_http=info".into()),
+        )
+        .init();
+
+    let canonical_workspace = workspace_dir
+        .canonicalize()
+        .with_context(|| format!("workspace does not exist: {}", workspace_dir.display()))?;
+    let user_profile = resolve_current_user().context("failed to resolve current OS user")?;
+    let user_home = hq_runtime_paths::resolve_user_home_preferring_env(&user_profile.name)
+        .unwrap_or_else(|_| user_profile.home.clone());
+
+    let auth = AuthService::initialize(&data_dir, AuthConfig::for_app("hqcode"))?;
+    let terminal = TerminalManager::new(
+        TmuxNamespace::new("hqcode"),
+        data_dir.join("hqcode-sessions.json"),
+        canonical_workspace.clone(),
+        user_profile,
+    );
+    let presets = PresetStore::load(&data_dir, "hqcode");
+
+    let static_dir = resolve_static_dir();
+    let ws_config = WorkspaceConfig {
+        display_root: workspace_dir.clone(),
+        root: canonical_workspace.clone(),
+        show_dot_entries: true,
+        allow_one_parent: true,
+    };
+
+    let state = AppState {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        static_dir,
+        workspace: Arc::new(RwLock::new(ws_config)),
+        auth: auth.clone(),
+        terminal,
+        presets,
+        user_home,
+    };
+
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind {addr}"))?;
+    let actual_addr = listener.local_addr()?;
+
+    info!("HQCode v{} listening on http://{}", state.version, actual_addr);
+    info!("workspace: {}", canonical_workspace.display());
+    info!("data dir: {}", data_dir.display());
+    if auth.has_initial_password_pending() {
+        info!(
+            "initial credentials written to {}",
+            auth.initial_password_path().display()
+        );
+    }
+
+    let app = build_router(state);
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("server exited with error")
+}
+
+fn resolve_static_dir() -> PathBuf {
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidate = cwd.join("static");
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/static"))
+}
+
+pub fn build_router(state: AppState) -> Router {
+    let protected = Router::new()
+        .route("/api/auth/logout", post(api_logout))
+        .route("/api/auth/password", post(api_change_password))
+        .route("/api/agents/detected", get(api_detected_agents))
+        .route("/api/entries", get(api_list_entries))
+        .route("/api/file", get(api_read_file).put(api_save_file))
+        .route("/api/file/rename", post(api_rename_path))
+        .route("/api/git/status", get(api_git_status))
+        .route("/api/git/diff", get(api_git_diff))
+        .route("/api/git/revert", post(api_git_revert))
+        .route("/api/git/commit", post(api_git_commit))
+        .route(
+            "/api/terminal/sessions",
+            get(api_list_sessions).post(api_create_session),
+        )
+        .route(
+            "/api/terminal/sessions/{id}",
+            put(api_rename_session).delete(api_close_session),
+        )
+        .route("/api/terminal/sessions/{id}/input", post(api_send_input))
+        .route("/api/terminal/sessions/{id}/enter", post(api_send_enter))
+        .route("/ws/terminal/{id}", get(ws_terminal))
+        .route("/api/presets", get(api_list_presets).post(api_upsert_preset))
+        .route("/api/presets/{id}", delete(api_delete_preset))
+        .route("/api/presets/{id}/apply", post(api_apply_preset))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
+
+    Router::new()
+        .route("/", get(serve_index))
+        .route("/login", get(serve_index))
+        .route("/static/{*path}", get(serve_static))
+        .route("/api/health", get(api_health))
+        .route("/api/auth/session", get(api_auth_session))
+        .route("/api/auth/login", post(api_login))
+        .merge(protected)
+        .fallback(get(serve_index))
+        .layer(CompressionLayer::new())
+        .with_state(state)
+}
+
+async fn require_auth(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let headers = request.headers();
+    let is_loopback = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip().is_loopback())
+        .unwrap_or(false);
+
+    if is_loopback
+        && let Some(auth_hdr) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+        && let Some(token) = auth_hdr.strip_prefix("Bearer ")
+        && state.auth.verify_local_token(token.trim())
+    {
+        return next.run(request).await;
+    }
+
+    if let Some(cookie_hdr) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok())
+        && let Some(token) = state.auth.extract_cookie_value(cookie_hdr)
+        && state.auth.verify_session_cookie(token).is_some()
+    {
+        return next.run(request).await;
+    }
+
+    AppError::unauthorized("authentication required").into_response()
+}
+
+async fn serve_index(State(state): State<AppState>) -> Response {
+    let disk_path = state.static_dir.join("index.html");
+    let html = tokio::fs::read_to_string(&disk_path)
+        .await
+        .ok()
+        .or_else(|| {
+            EMBEDDED_STATIC_DIR
+                .get_file("index.html")
+                .and_then(|f| f.contents_utf8())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "<h1>HQCode</h1><p>Missing index.html</p>".to_string());
+
+    let mut resp = Html(html).into_response();
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static(NO_STORE_CACHE));
+    resp
+}
+
+async fn serve_static(
+    State(state): State<AppState>,
+    AxumPath(asset_path): AxumPath<String>,
+    req_headers: HeaderMap,
+) -> Response {
+    let clean = asset_path.trim_start_matches('/');
+    if clean.is_empty() || clean.contains("..") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let disk_file = state.static_dir.join(clean);
+    let bytes = if let Ok(data) = tokio::fs::read(&disk_file).await {
+        data
+    } else if let Some(embedded) = EMBEDDED_STATIC_DIR.get_file(clean) {
+        embedded.contents().to_vec()
+    } else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let digest = hasher.finalize();
+    let etag = format!(
+        "\"{}\"",
+        digest.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    );
+
+    if req_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == etag)
+    {
+        return StatusCode::NOT_MODIFIED.into_response();
+    }
+
+    let content_type = content_type_for(clean);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, STATIC_CACHE)
+        .header(header::ETAG, etag)
+        .body(Body::from(bytes))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn content_type_for(path: &str) -> &'static str {
+    if path.ends_with(".html") {
+        "text/html; charset=utf-8"
+    } else if path.ends_with(".js") || path.ends_with(".mjs") {
+        "application/javascript; charset=utf-8"
+    } else if path.ends_with(".css") {
+        "text/css; charset=utf-8"
+    } else if path.ends_with(".svg") {
+        "image/svg+xml"
+    } else if path.ends_with(".png") {
+        "image/png"
+    } else if path.ends_with(".json") {
+        "application/json; charset=utf-8"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+async fn api_health(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "ok": true,
+        "name": "hqcode",
+        "version": state.version,
+    }))
+}
+
+#[derive(Serialize)]
+struct AuthSessionStatus {
+    authenticated: bool,
+    username: String,
+    initial_password_pending: bool,
+}
+
+async fn api_auth_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Json<AuthSessionStatus> {
+    let authenticated = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookie| state.auth.extract_cookie_value(cookie))
+        .and_then(|token| state.auth.verify_session_cookie(token))
+        .is_some();
+
+    Json(AuthSessionStatus {
+        authenticated,
+        username: state.auth.username(),
+        initial_password_pending: state.auth.has_initial_password_pending(),
+    })
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+async fn api_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<LoginRequest>,
+) -> ApiResult<Response> {
+    let valid = state
+        .auth
+        .verify_login(payload.username.trim(), &payload.password)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    if !valid {
+        return Err(AppError::unauthorized("invalid username or password"));
+    }
+
+    let token = state
+        .auth
+        .issue_session_cookie(payload.username.trim())
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    let is_https = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|p| p.eq_ignore_ascii_case("https"));
+
+    let mut resp = Json(serde_json::json!({
+        "ok": true,
+        "username": payload.username.trim(),
+    }))
+    .into_response();
+    if let Ok(val) = HeaderValue::from_str(&state.auth.build_set_cookie_header(&token, is_https)) {
+        resp.headers_mut().insert(header::SET_COOKIE, val);
+    }
+    Ok(resp)
+}
+
+async fn api_logout(State(state): State<AppState>) -> Response {
+    let mut resp = Json(serde_json::json!({ "ok": true })).into_response();
+    if let Ok(val) = HeaderValue::from_str(&state.auth.build_clear_cookie_header()) {
+        resp.headers_mut().insert(header::SET_COOKIE, val);
+    }
+    resp
+}
+
+#[derive(Deserialize)]
+struct ChangePasswordRequest {
+    current_password: String,
+    #[serde(default)]
+    new_username: Option<String>,
+    new_password: String,
+}
+
+async fn api_change_password(
+    State(state): State<AppState>,
+    Json(payload): Json<ChangePasswordRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    state
+        .auth
+        .change_password(
+            &payload.current_password,
+            payload.new_username.as_deref(),
+            &payload.new_password,
+        )
+        .await
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn api_detected_agents() -> Json<Vec<DetectedAgent>> {
+    let detected = tokio::task::spawn_blocking(detect_installed_agents)
+        .await
+        .unwrap_or_default();
+    Json(detected)
+}
+
+#[derive(Deserialize, Default)]
+struct PathQuery {
+    #[serde(default)]
+    path: String,
+}
+
+async fn api_list_entries(
+    State(state): State<AppState>,
+    Query(query): Query<PathQuery>,
+) -> ApiResult<Json<hq_workspace::DirectoryResponse>> {
+    let cfg = state
+        .workspace
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let res = list_entries(&cfg, &query.path)
+        .await
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    Ok(Json(res))
+}
+
+async fn api_read_file(
+    State(state): State<AppState>,
+    Query(query): Query<PathQuery>,
+) -> ApiResult<Json<hq_workspace::FileResponse>> {
+    let cfg = state
+        .workspace
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let res = read_utf8_file(&cfg, &query.path)
+        .await
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    Ok(Json(res))
+}
+
+#[derive(Deserialize)]
+struct SaveFileRequest {
+    path: String,
+    content: String,
+}
+
+async fn api_save_file(
+    State(state): State<AppState>,
+    Json(payload): Json<SaveFileRequest>,
+) -> ApiResult<Json<hq_workspace::SaveFileResponse>> {
+    let cfg = state
+        .workspace
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let res = write_utf8_file(&cfg, &payload.path, &payload.content)
+        .await
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    Ok(Json(res))
+}
+
+#[derive(Deserialize)]
+struct RenameRequest {
+    path: String,
+    name: String,
+}
+
+async fn api_rename_path(
+    State(state): State<AppState>,
+    Json(payload): Json<RenameRequest>,
+) -> ApiResult<Json<hq_workspace::RenamePathResponse>> {
+    let cfg = state
+        .workspace
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let res = rename_entry(&cfg, &payload.path, &payload.name)
+        .await
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    Ok(Json(res))
+}
+
+async fn api_git_status(
+    State(state): State<AppState>,
+) -> ApiResult<Json<hq_workspace::GitStatusSummary>> {
+    let root = state
+        .workspace
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .root
+        .clone();
+    let summary = git_status(&root)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(summary))
+}
+
+#[derive(Deserialize, Default)]
+struct DiffQuery {
+    #[serde(default)]
+    file: Option<String>,
+}
+
+async fn api_git_diff(
+    State(state): State<AppState>,
+    Query(query): Query<DiffQuery>,
+) -> ApiResult<Json<hq_workspace::GitDiffResponse>> {
+    let root = state
+        .workspace
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .root
+        .clone();
+    let diff = git_diff(&root, query.file.as_deref())
+        .await
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    Ok(Json(diff))
+}
+
+#[derive(Deserialize)]
+struct RevertFileRequest {
+    file: String,
+}
+
+async fn api_git_revert(
+    State(state): State<AppState>,
+    Json(payload): Json<RevertFileRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let root = state
+        .workspace
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .root
+        .clone();
+    git_revert_file(&root, &payload.file)
+        .await
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct CommitRequest {
+    message: String,
+    #[serde(default)]
+    files: Option<Vec<String>>,
+}
+
+async fn api_git_commit(
+    State(state): State<AppState>,
+    Json(payload): Json<CommitRequest>,
+) -> ApiResult<Json<hq_workspace::GitCommitResult>> {
+    let root = state
+        .workspace
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .root
+        .clone();
+    let res = git_commit(&root, &payload.message, payload.files)
+        .await
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    Ok(Json(res))
+}
+
+async fn api_list_sessions(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let sessions = state.terminal.list_sessions();
+    Json(serde_json::json!({ "sessions": sessions }))
+}
+
+async fn api_create_session(
+    State(state): State<AppState>,
+    Json(req): Json<CreateSessionRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let terminal = state.terminal.clone();
+    let meta = tokio::task::spawn_blocking(move || terminal.create_session(req))
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "session": meta })))
+}
+
+#[derive(Deserialize)]
+struct RenameSessionRequest {
+    name: String,
+}
+
+async fn api_rename_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<RenameSessionRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let session = state
+        .terminal
+        .rename_session(&id, &req.name)
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "session": session })))
+}
+
+async fn api_close_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let terminal = state.terminal.clone();
+    tokio::task::spawn_blocking(move || terminal.close_session(&id))
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .map_err(|e| AppError::not_found(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct InputRequest {
+    data: String,
+}
+
+async fn api_send_input(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<InputRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let terminal = state.terminal.clone();
+    tokio::task::spawn_blocking(move || terminal.send_input(&id, &req.data))
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn api_send_enter(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let terminal = state.terminal.clone();
+    tokio::task::spawn_blocking(move || terminal.send_enter(&id))
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn ws_terminal(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    ws: WebSocketUpgrade,
+) -> ApiResult<Response> {
+    let (client_id, snap) = state
+        .terminal
+        .subscribe(&id)
+        .map_err(|e| AppError::not_found(e.to_string()))?;
+    Ok(ws.on_upgrade(move |socket| handle_ws(state, id, client_id, snap, socket)))
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WsClientMsg {
+    Input { data: String },
+    PacedInput { data: String },
+    Enter,
+    Resize { cols: u16, rows: u16 },
+}
+
+async fn handle_ws(
+    state: AppState,
+    session_id: String,
+    client_id: u64,
+    mut snap: hq_tmux::SessionSnapshot,
+    socket: WebSocket,
+) {
+    let (mut sender, mut receiver) = socket.split();
+
+    if !snap.replay_bytes.is_empty() {
+        let _ = sender.send(Message::Binary(snap.replay_bytes.into())).await;
+    }
+    let ready_msg = serde_json::json!({ "type": "ready", "alive": snap.alive }).to_string();
+    if sender.send(Message::Text(ready_msg.into())).await.is_err() {
+        state.terminal.unregister_client(&session_id, client_id);
+        return;
+    }
+
+    let send_task = tokio::spawn(async move {
+        loop {
+            match snap.receiver.recv().await {
+                Ok(TerminalStreamEvent::Output(chunk)) => {
+                    if chunk.seq <= snap.replay_end_seq {
+                        continue;
+                    }
+                    if sender.send(Message::Binary(chunk.bytes.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(TerminalStreamEvent::ViewportSize(size)) => {
+                    let msg = serde_json::json!({
+                        "type": "resize",
+                        "cols": size.cols,
+                        "rows": size.rows,
+                    })
+                    .to_string();
+                    if sender.send(Message::Text(msg.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(TerminalStreamEvent::Closed) => {
+                    let _ = sender
+                        .send(Message::Text(
+                            serde_json::json!({ "type": "closed" }).to_string().into(),
+                        ))
+                        .await;
+                    break;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!("terminal websocket lagged by {skipped} events");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    while let Some(Ok(msg)) = receiver.next().await {
+        match msg {
+            Message::Text(txt) => {
+                if let Ok(parsed) = serde_json::from_str::<WsClientMsg>(&txt) {
+                    match parsed {
+                        WsClientMsg::Input { data } => {
+                            let _ = state.terminal.write_raw_input(&session_id, &data);
+                        }
+                        WsClientMsg::PacedInput { data } => {
+                            let terminal = state.terminal.clone();
+                            let sid = session_id.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                terminal.send_input(&sid, &data)
+                            })
+                            .await;
+                        }
+                        WsClientMsg::Enter => {
+                            let terminal = state.terminal.clone();
+                            let sid = session_id.clone();
+                            let _ = tokio::task::spawn_blocking(move || terminal.send_enter(&sid))
+                                .await;
+                        }
+                        WsClientMsg::Resize { cols, rows } => {
+                            let _ = state
+                                .terminal
+                                .resize_client(&session_id, client_id, cols, rows);
+                        }
+                    }
+                }
+            }
+            Message::Binary(bytes) => {
+                if let Ok(text) = std::str::from_utf8(&bytes) {
+                    let _ = state.terminal.write_raw_input(&session_id, text);
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    send_task.abort();
+    state.terminal.unregister_client(&session_id, client_id);
+}
+
+async fn api_list_presets(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let presets: Vec<ModelPreset> = state
+        .presets
+        .list()
+        .into_iter()
+        .map(|mut p| {
+            if !p.api_key.is_empty() {
+                p.api_key = "********".to_string();
+            }
+            p
+        })
+        .collect();
+    Json(serde_json::json!({ "presets": presets }))
+}
+
+async fn api_upsert_preset(
+    State(state): State<AppState>,
+    Json(preset): Json<ModelPreset>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let saved = state
+        .presets
+        .upsert(preset)
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "preset": saved })))
+}
+
+async fn api_delete_preset(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let removed = state
+        .presets
+        .remove(&id)
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    if !removed {
+        return Err(AppError::not_found("preset not found"));
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn api_apply_preset(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let preset = state
+        .presets
+        .resolve(&id)
+        .ok_or_else(|| AppError::not_found("preset not found"))?;
+    apply_preset(&state.user_home, &preset).map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn health_and_auth_gate_work() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let data_dir = std::env::temp_dir().join(format!("hq-srv-test-{nonce}"));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let user = resolve_current_user().unwrap();
+        let auth = AuthService::initialize(&data_dir, AuthConfig::for_app("hqcode")).unwrap();
+        let state = AppState {
+            version: "0.1.0".to_string(),
+            static_dir: PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/static")),
+            workspace: Arc::new(RwLock::new(WorkspaceConfig::new(PathBuf::from("/tmp")))),
+            auth,
+            terminal: TerminalManager::new(
+                TmuxNamespace::new("hqcode-srv-test"),
+                data_dir.join("sessions.json"),
+                PathBuf::from("/tmp"),
+                user.clone(),
+            ),
+            presets: PresetStore::load(&data_dir, "hqcode"),
+            user_home: user.home,
+        };
+        let app = build_router(state);
+
+        let health = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let unauth = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/entries")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+}

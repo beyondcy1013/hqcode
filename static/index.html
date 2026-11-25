@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>HQCode — Agents' Headquarters</title>
+  <link rel="stylesheet" href="/static/vendor/xterm.css" />
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <div id="login-view" class="login-shell hidden">
+    <div class="login-card">
+      <div class="brand-row">
+        <span class="pulse-dot"></span>
+        <h1>HQCode</h1>
+      </div>
+      <p class="subtitle">Keep native Claude Code, Codex &amp; shell sessions alive in tmux.</p>
+      <form id="login-form">
+        <label>
+          <span>Username</span>
+          <input id="login-username" type="text" autocomplete="username" value="hqcode" required />
+        </label>
+        <label>
+          <span>Password</span>
+          <input id="login-password" type="password" autocomplete="current-password" placeholder="Check .hqcode-initial-password on first run" required />
+        </label>
+        <p id="login-error" class="error-text hidden"></p>
+        <button type="submit" class="btn-primary full-width">Sign in to HQ</button>
+      </form>
+    </div>
+  </div>
+
+  <div id="app-view" class="hq-app hidden">
+    <header class="topbar">
+      <div class="topbar-left">
+        <button id="btn-toggle-sidebar" class="icon-btn mobile-only" title="Sessions &amp; Files">☰</button>
+        <div class="brand-row">
+          <span class="pulse-dot"></span>
+          <span class="brand-name">HQCode</span>
+        </div>
+        <span id="workspace-path-pill" class="path-pill" title="Workspace root"></span>
+      </div>
+      <div class="topbar-right">
+        <button id="btn-open-diff" class="btn-ghost">
+          <span>Git Diff</span>
+          <span id="diff-count-badge" class="badge hidden">0</span>
+        </button>
+        <button id="btn-open-settings" class="btn-ghost">Presets &amp; Security</button>
+        <button id="btn-logout" class="btn-ghost">Logout</button>
+      </div>
+    </header>
+
+    <div class="workspace-body">
+      <aside id="sidebar" class="sidebar">
+        <section class="panel-section">
+          <div class="section-header">
+            <span>Quick Launch</span>
+          </div>
+          <div id="detected-agents" class="agent-grid"></div>
+        </section>
+
+        <section class="panel-section">
+          <div class="section-header">
+            <span>Live Sessions</span>
+            <button id="btn-new-shell" class="mini-btn" title="New Shell Session">+ Shell</button>
+          </div>
+          <div id="session-list" class="session-list"></div>
+        </section>
+
+        <section class="panel-section flex-fill">
+          <div class="section-header">
+            <span>Files</span>
+            <button id="btn-refresh-files" class="mini-btn">↻</button>
+          </div>
+          <div id="file-breadcrumbs" class="breadcrumbs"></div>
+          <div id="file-list" class="file-list"></div>
+        </section>
+      </aside>
+
+      <main class="main-stage">
+        <div id="terminal-container" class="terminal-pane">
+          <div id="empty-state" class="empty-state">
+            <h2>Your Coding Agents' Headquarters</h2>
+            <p>Launch a persistent tmux session from the sidebar. Close your browser or switch to your phone anytime without losing context.</p>
+          </div>
+          <div id="xterm-host" class="xterm-host hidden"></div>
+        </div>
+
+        <div id="editor-overlay" class="editor-overlay hidden">
+          <div class="editor-header">
+            <span id="editor-file-path" class="mono"></span>
+            <div class="editor-actions">
+              <button id="btn-save-file" class="btn-primary">Save</button>
+              <button id="btn-close-editor" class="btn-ghost">Close</button>
+            </div>
+          </div>
+          <textarea id="editor-textarea" class="editor-textarea" spellcheck="false"></textarea>
+        </div>
+      </main>
+
+      <aside id="diff-drawer" class="diff-drawer hidden">
+        <div class="drawer-header">
+          <div>
+            <strong>Git Review</strong>
+            <span id="diff-branch-pill" class="branch-pill"></span>
+          </div>
+          <div class="drawer-actions">
+            <button id="btn-refresh-diff" class="mini-btn">↻</button>
+            <button id="btn-close-diff" class="mini-btn">✕</button>
+          </div>
+        </div>
+        <div class="commit-box">
+          <input id="commit-message-input" type="text" placeholder="Commit message..." />
+          <button id="btn-git-commit" class="btn-primary">Commit</button>
+        </div>
+        <div id="diff-file-list" class="diff-file-list"></div>
+        <pre id="diff-viewer" class="diff-viewer"></pre>
+      </aside>
+    </div>
+
+    <!-- Direct child of .hq-app so fixed positioning stays outside backdrop-filter/transform containers -->
+    <div id="hq-mobile-keys" class="mobile-keys">
+      <div class="mobile-key-row">
+        <button class="mkey" data-key="esc">Esc</button>
+        <button class="mkey" data-key="tab">Tab</button>
+        <button class="mkey" data-key="ctrlc">^C</button>
+        <button class="mkey" data-key="up">↑</button>
+        <button class="mkey" data-key="down">↓</button>
+        <button class="mkey accent" data-key="approve">y</button>
+        <button class="mkey primary" data-key="enter">↵</button>
+        <button class="mkey" data-action="diff">Diff</button>
+      </div>
+      <div class="mobile-compose-row">
+        <input id="mobile-quick-input" type="text" placeholder="Send steer / prompt..." autocomplete="off" />
+        <button id="btn-mobile-send" class="btn-primary">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="settings-modal" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>Presets &amp; Security</h3>
+        <button id="btn-close-settings" class="mini-btn">✕</button>
+      </div>
+      <div class="modal-body">
+        <section class="modal-section">
+          <h4>Model Presets (real config sync)</h4>
+          <div id="preset-list" class="preset-list"></div>
+          <form id="preset-form" class="preset-form">
+            <input id="preset-name" placeholder="Name (e.g. Claude Sonnet)" required />
+            <select id="preset-kind">
+              <option value="claude_api">Claude API</option>
+              <option value="codex_api">Codex API</option>
+            </select>
+            <input id="preset-model" placeholder="Model ID" required />
+            <input id="preset-base-url" placeholder="Base URL (optional)" />
+            <input id="preset-api-key" type="password" placeholder="API Key (optional)" />
+            <button type="submit" class="btn-primary">Save Preset</button>
+          </form>
+        </section>
+        <section class="modal-section">
+          <h4>Change Password</h4>
+          <form id="password-form" class="preset-form">
+            <input id="pw-current" type="password" placeholder="Current password" required />
+            <input id="pw-new" type="password" placeholder="New password (min 8 chars)" required />
+            <button type="submit" class="btn-ghost">Update Password</button>
+          </form>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/vendor/xterm.js"></script>
+  <script src="/static/vendor/xterm-addon-fit.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
