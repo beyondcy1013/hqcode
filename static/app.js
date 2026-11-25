@@ -18,6 +18,9 @@ const state = {
   userScrolledUp: false,
   renamingId: null,
   pollTimer: null,
+  qrExpiresAt: 0,
+  qrTimer: null,
+  presetsCache: [],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -36,6 +39,8 @@ function applyI18n() {
   const toggleText = state.lang === 'zh' ? '中文' : 'EN';
   if ($('btn-lang-toggle')) $('btn-lang-toggle').textContent = toggleText;
   if ($('btn-lang-login')) $('btn-lang-login').textContent = toggleText;
+  updatePresetSubmitButton();
+  updateLaunchCwdPill();
 }
 
 function toggleLang() {
@@ -44,6 +49,12 @@ function toggleLang() {
   applyI18n();
   renderSessions();
   refreshGitStatus();
+  if (!$('connect-modal').classList.contains('hidden')) {
+    refreshConnectModal(false);
+  }
+  if (!$('settings-modal').classList.contains('hidden')) {
+    loadSettingsData();
+  }
 }
 
 function showToast(message, kind = 'info') {
@@ -68,6 +79,50 @@ async function api(url, options = {}) {
     throw new Error(data.error || `HTTP ${resp.status}`);
   }
   return data;
+}
+
+function attachConfirmAction(btn, idleLabel, confirmLabel, onConfirmed) {
+  let armed = false;
+  let armTimer = null;
+  btn.textContent = idleLabel;
+  btn.addEventListener('click', async (ev) => {
+    ev.stopPropagation();
+    if (!armed) {
+      armed = true;
+      btn.textContent = confirmLabel;
+      btn.classList.add('confirming');
+      armTimer = setTimeout(() => {
+        armed = false;
+        btn.textContent = idleLabel;
+        btn.classList.remove('confirming');
+      }, 3000);
+      return;
+    }
+    clearTimeout(armTimer);
+    armed = false;
+    btn.textContent = idleLabel;
+    btn.classList.remove('confirming');
+    await onConfirmed();
+  });
+}
+
+function inferFriendlyDeviceName() {
+  const ua = navigator.userAgent || '';
+  let os = 'Browser';
+  if (/iphone/i.test(ua)) os = 'iPhone';
+  else if (/ipad/i.test(ua)) os = 'iPad';
+  else if (/android/i.test(ua)) os = 'Android';
+  else if (/mac os/i.test(ua)) os = 'macOS';
+  else if (/windows/i.test(ua)) os = 'Windows';
+  else if (/linux/i.test(ua)) os = 'Linux';
+
+  let browser = '';
+  if (/edg\//i.test(ua)) browser = 'Edge';
+  else if (/chrome/i.test(ua)) browser = 'Chrome';
+  else if (/safari/i.test(ua)) browser = 'Safari';
+  else if (/firefox/i.test(ua)) browser = 'Firefox';
+
+  return browser ? `${os} · ${browser}` : os;
 }
 
 function syncVisualViewportHeight() {
@@ -102,8 +157,37 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+async function tryRedeemPairCodeFromUrl() {
+  const params = new URLSearchParams(location.search);
+  const code = params.get('code');
+  if (!code) return null;
+
+  history.replaceState({}, '', '/');
+  const banner = $('pairing-banner');
+  $('login-view').classList.remove('hidden');
+  banner.className = 'pairing-banner';
+  banner.textContent = t('pairingInProgress');
+
+  try {
+    await api('/api/remote/redeem', {
+      method: 'POST',
+      body: JSON.stringify({
+        code,
+        device_name: inferFriendlyDeviceName(),
+      }),
+    });
+    banner.classList.add('hidden');
+    return { paired: true };
+  } catch (err) {
+    banner.className = 'pairing-banner error';
+    banner.textContent = `${t('pairingFailedPrefix')}: ${err.message}`;
+    return { paired: false };
+  }
+}
+
 async function bootstrap() {
   applyI18n();
+  const pairOutcome = await tryRedeemPairCodeFromUrl();
   const session = await api('/api/auth/session');
   if (!session.authenticated) {
     $('login-username').value = session.username || 'hqcode';
@@ -121,6 +205,9 @@ async function bootstrap() {
     refreshGitStatus(),
     refreshSystemInfo(),
   ]);
+  if (pairOutcome?.paired) {
+    showToast(t('pairedWelcome'), 'ok');
+  }
   if (!state.pollTimer) {
     state.pollTimer = setInterval(() => {
       loadSessions();
@@ -167,6 +254,23 @@ async function refreshSystemInfo() {
   } catch (_) {}
 }
 
+function updateLaunchCwdPill() {
+  const pill = $('launch-cwd-pill');
+  if (!pill) return;
+  if (state.currentPath) {
+    pill.textContent = `📁 ${state.currentPath} ✕`;
+    pill.title = state.currentPath;
+    pill.classList.remove('hidden');
+  } else {
+    pill.textContent = '';
+    pill.classList.add('hidden');
+  }
+}
+
+$('launch-cwd-pill')?.addEventListener('click', () => {
+  loadFiles('');
+});
+
 async function loadDetectedAgents() {
   const agents = await api('/api/agents/detected');
   const host = $('detected-agents');
@@ -178,7 +282,8 @@ async function loadDetectedAgents() {
     btn.innerHTML = `<span>${agent.label}</span><span>${agent.available ? '▶' : '—'}</span>`;
     btn.addEventListener('click', () => {
       const cmd = agent.id === 'shell' ? '' : agent.command;
-      createSession(agent.label, cmd);
+      const suffix = state.currentPath ? ` (${state.currentPath.split('/').pop()})` : '';
+      createSession(`${agent.label}${suffix}`, cmd, state.currentPath || null);
     });
     host.appendChild(btn);
   }
@@ -246,16 +351,47 @@ function startInlineRename(session, container) {
   input.select();
 }
 
+function renderMobileSessionSelect() {
+  const select = $('mobile-session-select');
+  if (!select) return;
+  select.innerHTML = '';
+  if (state.sessions.length === 0) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = t('noSessionsOption');
+    select.appendChild(opt);
+    select.disabled = true;
+    return;
+  }
+  select.disabled = false;
+  for (const s of state.sessions) {
+    const opt = document.createElement('option');
+    opt.value = s.id;
+    opt.textContent = `${statusDotChar(s)} ${s.name}`;
+    opt.selected = s.id === state.activeSessionId;
+    select.appendChild(opt);
+  }
+}
+
+$('mobile-session-select')?.addEventListener('change', (ev) => {
+  const sid = ev.target.value;
+  if (sid) {
+    selectSession(sid);
+  }
+});
+
 function renderSessions() {
   const list = $('session-list');
   const tabs = $('session-tabs');
   list.innerHTML = '';
   tabs.innerHTML = '';
+  renderMobileSessionSelect();
 
   for (const s of state.sessions) {
     // Sidebar item
     const row = document.createElement('div');
     row.className = `session-item${s.id === state.activeSessionId ? ' active' : ''}`;
+    row.dataset.sessionId = s.id;
 
     if (state.renamingId === s.id) {
       startInlineRename(s, row);
@@ -280,10 +416,8 @@ function renderSessions() {
       });
 
       const closeBtn = document.createElement('button');
-      closeBtn.className = 'mini-btn';
-      closeBtn.textContent = '✕';
-      closeBtn.addEventListener('click', async (ev) => {
-        ev.stopPropagation();
+      closeBtn.className = 'mini-btn session-close-btn';
+      attachConfirmAction(closeBtn, '✕', t('confirmClose'), async () => {
         await closeSession(s.id);
       });
 
@@ -294,6 +428,7 @@ function renderSessions() {
     // Top tab item
     const tab = document.createElement('div');
     tab.className = `session-tab${s.id === state.activeSessionId ? ' active' : ''}`;
+    tab.dataset.sessionId = s.id;
     const tDot = document.createElement('span');
     tDot.className = statusDotClass(s);
     tDot.textContent = statusDotChar(s);
@@ -303,11 +438,10 @@ function renderSessions() {
       ev.stopPropagation();
       startInlineRename(s, row);
     });
-    const tClose = document.createElement('span');
-    tClose.textContent = '×';
-    tClose.style.opacity = '0.65';
-    tClose.addEventListener('click', async (ev) => {
-      ev.stopPropagation();
+    const tClose = document.createElement('button');
+    tClose.type = 'button';
+    tClose.className = 'tab-close-btn mini-btn';
+    attachConfirmAction(tClose, '×', t('confirmClose'), async () => {
       await closeSession(s.id);
     });
     tab.append(tDot, tLabel, tClose);
@@ -341,7 +475,7 @@ async function createSession(label, startupCommand, cwd = null) {
     }
     await loadSessions();
     if (res.session) {
-      selectSession(res.session.id);
+      selectSession(res.session.id, true);
       $('sidebar').classList.remove('open');
     }
   } catch (err) {
@@ -349,7 +483,10 @@ async function createSession(label, startupCommand, cwd = null) {
   }
 }
 
-$('btn-new-shell').addEventListener('click', () => createSession('Shell', ''));
+$('btn-new-shell').addEventListener('click', () => {
+  const baseName = state.currentPath ? `Shell (${state.currentPath.split('/').pop()})` : 'Shell';
+  createSession(baseName, '', state.currentPath || null);
+});
 
 // Session output search
 let searchTimer = null;
@@ -475,7 +612,18 @@ function sendResize() {
   }
 }
 
-function selectSession(sessionId) {
+function selectSession(sessionId, forceReconnect = false) {
+  if (
+    !forceReconnect &&
+    sessionId === state.activeSessionId &&
+    state.ws &&
+    state.ws.readyState === WebSocket.OPEN
+  ) {
+    state.term?.focus();
+    renderMobileSessionSelect();
+    return;
+  }
+
   state.activeSessionId = sessionId;
   renderSessions();
   $('empty-state').classList.add('hidden');
@@ -516,7 +664,7 @@ function selectSession(sessionId) {
       setConnPill('reconnecting');
       setTimeout(() => {
         if (state.activeSessionId === sessionId && (!state.ws || state.ws.readyState === WebSocket.CLOSED)) {
-          selectSession(sessionId);
+          selectSession(sessionId, true);
         }
       }, 1500);
     }
@@ -529,6 +677,7 @@ function selectSession(sessionId) {
 
 async function loadFiles(path) {
   state.currentPath = path;
+  updateLaunchCwdPill();
   const data = await api(`/api/entries?path=${encodeURIComponent(path)}`);
   $('workspace-path-pill').textContent = data.display_path;
   const bc = $('file-breadcrumbs');
@@ -653,23 +802,7 @@ function renderDiffFileList(files) {
 
     const revertBtn = document.createElement('button');
     revertBtn.className = 'mini-btn';
-    revertBtn.textContent = t('revert');
-    let armed = false;
-    let armTimer = null;
-    revertBtn.addEventListener('click', async (ev) => {
-      ev.stopPropagation();
-      if (!armed) {
-        armed = true;
-        revertBtn.textContent = t('confirmRevert');
-        revertBtn.classList.add('confirming');
-        armTimer = setTimeout(() => {
-          armed = false;
-          revertBtn.textContent = t('revert');
-          revertBtn.classList.remove('confirming');
-        }, 3000);
-        return;
-      }
-      clearTimeout(armTimer);
+    attachConfirmAction(revertBtn, t('revert'), t('confirmRevert'), async () => {
       try {
         await api('/api/git/revert', {
           method: 'POST',
@@ -782,21 +915,232 @@ document.querySelectorAll('#hq-mobile-keys .mkey').forEach((btn) => {
   });
 });
 
-$('btn-mobile-send').addEventListener('click', async () => {
-  const val = $('mobile-quick-input').value;
+async function sendMobileQuickInput() {
+  const input = $('mobile-quick-input');
+  const val = input.value;
   if (!val || !state.activeSessionId) return;
   await api(`/api/terminal/sessions/${state.activeSessionId}/input`, {
     method: 'POST',
     body: JSON.stringify({ data: `${val}\r` }),
   });
-  $('mobile-quick-input').value = '';
+  input.value = '';
+}
+
+$('btn-mobile-send').addEventListener('click', sendMobileQuickInput);
+$('mobile-quick-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.isComposing) {
+    e.preventDefault();
+    sendMobileQuickInput();
+  }
 });
+
+// Remote QR Connect modal
+function renderSvgInto(host, svgMarkup) {
+  host.innerHTML = '';
+  if (!svgMarkup) return;
+  const doc = new DOMParser().parseFromString(svgMarkup, 'image/svg+xml');
+  const svg = doc.documentElement;
+  if (svg && svg.nodeName.toLowerCase() === 'svg') {
+    host.appendChild(document.importNode(svg, true));
+  }
+}
+
+function startQrCountdown(expiresInSecs) {
+  if (state.qrTimer) {
+    clearInterval(state.qrTimer);
+    state.qrTimer = null;
+  }
+  state.qrExpiresAt = Date.now() + expiresInSecs * 1000;
+  const update = () => {
+    const rem = Math.max(0, Math.floor((state.qrExpiresAt - Date.now()) / 1000));
+    const el = $('connect-qr-ttl');
+    if (!el) return;
+    el.textContent = rem > 0 ? `${t('expiresInPrefix')}: ${rem}s` : t('qrExpired');
+  };
+  update();
+  state.qrTimer = setInterval(update, 1000);
+}
+
+function renderPairedDevices(devices) {
+  const host = $('paired-devices-list');
+  host.innerHTML = '';
+  if (!devices || devices.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'muted-empty';
+    empty.textContent = t('noPairedDevices');
+    host.appendChild(empty);
+    return;
+  }
+  for (const d of devices) {
+    const row = document.createElement('div');
+    row.className = `device-row${d.revoked ? ' revoked' : ''}`;
+    row.dataset.deviceId = d.id;
+
+    const info = document.createElement('div');
+    info.className = 'device-info';
+    const nameEl = document.createElement('strong');
+    nameEl.textContent = d.label || d.id;
+    const metaEl = document.createElement('span');
+    metaEl.className = 'mono device-meta';
+    const ipText = d.remote_ip ? `${d.remote_ip} · ` : '';
+    const when = d.paired_at ? new Date(d.paired_at * 1000).toLocaleString() : '';
+    metaEl.textContent = `${ipText}${when}`;
+    info.append(nameEl, metaEl);
+
+    if (d.revoked) {
+      const badge = document.createElement('span');
+      badge.className = 'mini-btn';
+      badge.textContent = t('revokedBadge');
+      row.append(info, badge);
+    } else {
+      const revokeBtn = document.createElement('button');
+      revokeBtn.className = 'mini-btn';
+      revokeBtn.type = 'button';
+      revokeBtn.textContent = t('revoke');
+      revokeBtn.addEventListener('click', async () => {
+        try {
+          await api(`/api/remote/devices/${d.id}`, { method: 'DELETE' });
+          showToast(t('revokedDevice'), 'ok');
+          await refreshConnectModal(false);
+        } catch (err) {
+          showToast(err.message, 'err');
+        }
+      });
+      row.append(info, revokeBtn);
+    }
+    host.appendChild(row);
+  }
+}
+
+async function issuePairingQr() {
+  const custom = $('connect-custom-url').value.trim();
+  const selected = $('connect-endpoint-select').value;
+  const endpointUrl = custom || selected || null;
+  const data = await api('/api/remote/tickets', {
+    method: 'POST',
+    body: JSON.stringify({ endpoint_url: endpointUrl, ttl_secs: 300 }),
+  });
+  renderSvgInto($('connect-qr-svg'), data.qr_svg);
+  $('connect-pair-url').value = data.pair_url || '';
+  startQrCountdown(data.expires_in_secs || 300);
+}
+
+async function refreshConnectModal(issueNewQr = true) {
+  const status = await api('/api/remote/status');
+  $('connect-loopback-warn').classList.toggle('hidden', !status.is_loopback_only);
+
+  const select = $('connect-endpoint-select');
+  const prevValue = select.value;
+  select.innerHTML = '';
+  for (const ep of status.endpoints || []) {
+    const opt = document.createElement('option');
+    opt.value = ep.url;
+    opt.textContent = ep.label;
+    select.appendChild(opt);
+  }
+  if (prevValue && [...select.options].some((o) => o.value === prevValue)) {
+    select.value = prevValue;
+  }
+  renderPairedDevices(status.devices || []);
+  if (issueNewQr) {
+    await issuePairingQr();
+  }
+}
+
+$('btn-open-connect').addEventListener('click', async () => {
+  $('connect-modal').classList.remove('hidden');
+  try {
+    await refreshConnectModal(true);
+  } catch (err) {
+    showToast(err.message, 'err');
+  }
+});
+
+$('btn-close-connect').addEventListener('click', () => {
+  $('connect-modal').classList.add('hidden');
+  if (state.qrTimer) {
+    clearInterval(state.qrTimer);
+    state.qrTimer = null;
+  }
+});
+
+$('connect-endpoint-select').addEventListener('change', () => issuePairingQr().catch((err) => showToast(err.message, 'err')));
+$('btn-refresh-qr').addEventListener('click', () => refreshConnectModal(true).catch((err) => showToast(err.message, 'err')));
+$('btn-copy-pair-url').addEventListener('click', async () => {
+  const url = $('connect-pair-url').value;
+  if (!url) return;
+  try {
+    await navigator.clipboard.writeText(url);
+    showToast(t('linkCopied'), 'ok');
+  } catch (_) {
+    $('connect-pair-url').select();
+    document.execCommand?.('copy');
+    showToast(t('linkCopied'), 'ok');
+  }
+});
+
+// Presets & Settings
+function updatePresetSubmitButton() {
+  const btn = $('btn-save-preset');
+  const cancelBtn = $('btn-cancel-preset-edit');
+  const editing = Boolean($('preset-id')?.value);
+  if (btn) {
+    btn.textContent = editing ? t('saveChanges') : t('savePreset');
+  }
+  if (cancelBtn) {
+    cancelBtn.classList.toggle('hidden', !editing);
+  }
+}
+
+function resetPresetForm() {
+  $('preset-form').reset();
+  $('preset-id').value = '';
+  $('preset-api-key').placeholder = 'API Key (optional)';
+  updatePresetSubmitButton();
+}
+
+function populatePresetEdit(p) {
+  $('preset-id').value = p.id;
+  $('preset-name').value = p.name;
+  $('preset-kind').value = p.kind;
+  $('preset-model').value = p.model;
+  $('preset-base-url').value = p.base_url || '';
+  $('preset-api-key').value = '';
+  $('preset-api-key').placeholder = p.api_key ? 'Leave blank to keep existing key' : 'API Key (optional)';
+  updatePresetSubmitButton();
+}
+
+async function loadActiveCliConfigs() {
+  const active = await api('/api/presets/active');
+  const host = $('active-cli-configs');
+  host.innerHTML = '';
+  const items = [
+    ['Codex', active.codex],
+    ['Claude', active.claude],
+  ];
+  for (const [label, cfg] of items) {
+    const card = document.createElement('div');
+    card.className = 'active-cli-card';
+    const title = document.createElement('strong');
+    title.textContent = label;
+    const detail = document.createElement('div');
+    detail.className = 'mono';
+    detail.style.color = '#8b949e';
+    detail.style.fontSize = '11px';
+    detail.textContent = cfg?.configured
+      ? `${cfg.model || '-'} ${cfg.base_url ? `· ${cfg.base_url}` : ''}`
+      : t('notConfigured');
+    card.append(title, detail);
+    host.appendChild(card);
+  }
+}
 
 async function loadPresets() {
   const data = await api('/api/presets');
+  state.presetsCache = data.presets || [];
   const host = $('preset-list');
   host.innerHTML = '';
-  for (const p of data.presets || []) {
+  for (const p of state.presetsCache) {
     const row = document.createElement('div');
     row.className = 'preset-row';
     const info = document.createElement('span');
@@ -806,35 +1150,69 @@ async function loadPresets() {
     const actions = document.createElement('div');
     actions.style.display = 'flex';
     actions.style.gap = '6px';
+
     const applyBtn = document.createElement('button');
     applyBtn.className = 'mini-btn';
+    applyBtn.type = 'button';
     applyBtn.textContent = t('apply');
     applyBtn.onclick = async () => {
       try {
         await api(`/api/presets/${p.id}/apply`, { method: 'POST' });
         showToast(`${t('presetApplied')}: ${p.name}`, 'ok');
+        await loadActiveCliConfigs();
       } catch (err) {
         showToast(err.message, 'err');
       }
     };
+
+    const editBtn = document.createElement('button');
+    editBtn.className = 'mini-btn';
+    editBtn.type = 'button';
+    editBtn.textContent = t('edit');
+    editBtn.onclick = () => populatePresetEdit(p);
+
     const delBtn = document.createElement('button');
     delBtn.className = 'mini-btn';
+    delBtn.type = 'button';
     delBtn.textContent = '✕';
     delBtn.onclick = async () => {
       await api(`/api/presets/${p.id}`, { method: 'DELETE' });
+      if ($('preset-id').value === p.id) resetPresetForm();
       await loadPresets();
     };
-    actions.append(applyBtn, delBtn);
+    actions.append(applyBtn, editBtn, delBtn);
     row.append(info, actions);
     host.appendChild(row);
   }
 }
 
+async function loadSettingsData() {
+  await Promise.all([loadPresets(), loadActiveCliConfigs()]);
+}
+
 $('btn-open-settings').addEventListener('click', async () => {
   $('settings-modal').classList.remove('hidden');
-  await loadPresets();
+  resetPresetForm();
+  await loadSettingsData();
 });
 $('btn-close-settings').addEventListener('click', () => $('settings-modal').classList.add('hidden'));
+$('btn-cancel-preset-edit').addEventListener('click', resetPresetForm);
+
+async function importPresetFromCli(kind) {
+  try {
+    const res = await api('/api/presets/import', {
+      method: 'POST',
+      body: JSON.stringify({ kind }),
+    });
+    showToast(`${t('importedPrefix')}: ${res.preset?.name || kind}`, 'ok');
+    await loadSettingsData();
+  } catch (err) {
+    showToast(err.message, 'err');
+  }
+}
+
+$('btn-import-codex').addEventListener('click', () => importPresetFromCli('codex_api'));
+$('btn-import-claude').addEventListener('click', () => importPresetFromCli('claude_api'));
 
 $('preset-form').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -842,7 +1220,7 @@ $('preset-form').addEventListener('submit', async (e) => {
     await api('/api/presets', {
       method: 'POST',
       body: JSON.stringify({
-        id: '',
+        id: $('preset-id').value || '',
         name: $('preset-name').value,
         kind: $('preset-kind').value,
         model: $('preset-model').value,
@@ -851,7 +1229,7 @@ $('preset-form').addEventListener('submit', async (e) => {
         wire_api: 'responses',
       }),
     });
-    e.target.reset();
+    resetPresetForm();
     await loadPresets();
   } catch (err) {
     showToast(err.message, 'err');

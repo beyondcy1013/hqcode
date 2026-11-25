@@ -10,6 +10,7 @@ members = [
     "crates/hq_auth",
     "crates/hq_fs_atomic",
     "crates/hq_presets",
+    "crates/hq_remote_connect",
     "crates/hq_runtime_paths",
     "crates/hq_tmux",
     "crates/hq_workspace",
@@ -22,6 +23,7 @@ futures-util = "0.3"
 hq_auth = { path = "crates/hq_auth" }
 hq_fs_atomic = { path = "crates/hq_fs_atomic" }
 hq_presets = { path = "crates/hq_presets" }
+hq_remote_connect = { path = "crates/hq_remote_connect" }
 hq_runtime_paths = { path = "crates/hq_runtime_paths" }
 hq_tmux = { path = "crates/hq_tmux" }
 hq_workspace = { path = "crates/hq_workspace" }

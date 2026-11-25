@@ -56,10 +56,19 @@ curl -fsSL https://raw.githubusercontent.com/beyondcy1013/hqcode/main/scripts/in
 启动服务：
 
 ```bash
-hqcode serve --addr 127.0.0.1:9900 --workspace /path/to/your/projects
+# 仅本机使用（终端启动卡片直接显示首次登录账号密码）
+hqcode serve --workspace /path/to/your/projects
+
+# 开启局域网 / Tailscale 监听，并在终端直接打印手机扫码直连二维码
+hqcode serve --lan --workspace /path/to/your/projects
 ```
 
-首次启动会在 `~/.hqcode/.hqcode-initial-password` 生成仅所有者可读（`0600`）的随机初始密码，首次成功登录后自动删除。
+- **手机扫码免密连接**：扫描启动终端二维码或点击 Web 顶栏 **📱 扫码连接**，即可通过一次性 `/pair?code=...` 票据免密配对手机并接入同一现场，随时可在设备列表中一键撤销。
+- **开箱即用诊断与维护命令**：
+  - `hqcode pair`：向运行中的本机服务申请新的一次性手机配对二维码并打印到终端。
+  - `hqcode doctor`：一键体检 `tmux`、`git`、已安装 Agent、`PATH` 及可用局域网/Tailscale 地址。
+  - `hqcode passwd`：本机重置 Web 登录密码。
+- **子目录快捷启动**：在左侧文件树进入任意子仓库后，点击 **Quick Launch** 即可直接在该子目录拉起 Claude / Codex / OpenCode / Shell。
 
 ### 源码构建
 

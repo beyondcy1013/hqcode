@@ -21,6 +21,7 @@
         <button id="btn-lang-login" class="mini-btn" type="button">EN / 中</button>
       </div>
       <p class="subtitle" data-i18n="subtitle">Keep native Claude Code, Codex &amp; shell sessions alive in tmux.</p>
+      <div id="pairing-banner" class="pairing-banner hidden"></div>
       <form id="login-form">
         <label>
           <span data-i18n="username">Username</span>
@@ -48,8 +49,13 @@
       </div>
       <div class="topbar-right">
         <span id="rss-pill" class="metric-pill hidden" title="Server RSS memory"></span>
+        <button id="btn-open-connect" class="btn-ghost" title="Phone &amp; Remote QR Connect">
+          <span>📱</span>
+          <span class="desktop-only" data-i18n="connect">Connect</span>
+        </button>
         <button id="btn-open-diff" class="btn-ghost" title="Ctrl+Shift+D">
-          <span data-i18n="gitDiff">Git Diff</span>
+          <span class="desktop-only" data-i18n="gitDiff">Git Diff</span>
+          <span class="mobile-only">Diff</span>
           <span id="diff-count-badge" class="badge hidden">0</span>
         </button>
         <button id="btn-open-settings" class="btn-ghost" title="Presets &amp; Security">
@@ -66,6 +72,7 @@
         <section class="panel-section">
           <div class="section-header">
             <span data-i18n="quickLaunch">Quick Launch</span>
+            <button id="launch-cwd-pill" class="cwd-pill hidden" type="button" title="Reset to root"></button>
           </div>
           <div id="detected-agents" class="agent-grid"></div>
         </section>
@@ -94,6 +101,7 @@
 
       <main class="main-stage">
         <div class="session-tab-bar">
+          <select id="mobile-session-select" class="mobile-only mobile-session-select" aria-label="Active session"></select>
           <div id="session-tabs" class="session-tabs"></div>
           <div class="tab-bar-status">
             <span id="conn-pill" class="conn-pill hidden"></span>
@@ -149,8 +157,11 @@
         <button class="mkey" data-key="esc">Esc</button>
         <button class="mkey" data-key="tab">Tab</button>
         <button class="mkey" data-key="ctrlc">^C</button>
-        <button class="mkey" data-key="up">↑</button>
+        <button class="mkey" data-key="ctrld">^D</button>
+        <button class="mkey" data-key="left">←</button>
         <button class="mkey" data-key="down">↓</button>
+        <button class="mkey" data-key="up">↑</button>
+        <button class="mkey" data-key="right">→</button>
         <button class="mkey accent" data-key="approve">y</button>
         <button class="mkey" data-key="reject">n</button>
         <button class="mkey primary" data-key="enter">↵</button>
@@ -163,6 +174,41 @@
     </div>
   </div>
 
+  <div id="connect-modal" class="modal-backdrop hidden">
+    <div class="modal-card connect-card">
+      <div class="modal-header">
+        <h3 data-i18n="connectTitle">Phone &amp; Remote QR Connect</h3>
+        <button id="btn-close-connect" class="mini-btn" type="button">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="connect-desc" data-i18n="connectDesc">Scan with your phone camera to pair once and open this workspace directly without typing passwords.</p>
+        <div id="connect-loopback-warn" class="warn-banner hidden" data-i18n="loopbackWarn">
+          Server is bound to localhost only (127.0.0.1). Restart with --lan or --public-url &lt;URL&gt; so your phone can reach it.
+        </div>
+        <section class="modal-section">
+          <h4 data-i18n="endpointLabel">Target Endpoint</h4>
+          <div class="connect-controls">
+            <select id="connect-endpoint-select"></select>
+            <button id="btn-refresh-qr" class="btn-ghost" type="button" data-i18n="refreshQr">New QR</button>
+          </div>
+          <input id="connect-custom-url" type="url" class="full-width" style="margin-top: 8px;" data-i18n-placeholder="customUrlPlaceholder" placeholder="Optional custom URL (e.g. https://hq.example.com)" />
+        </section>
+        <section class="modal-section qr-section">
+          <div id="connect-qr-svg" class="qr-card"></div>
+          <div id="connect-qr-ttl" class="qr-ttl mono"></div>
+          <div class="pair-url-row">
+            <input id="connect-pair-url" type="text" class="mono" readonly />
+            <button id="btn-copy-pair-url" class="btn-primary" type="button" data-i18n="copyLink">Copy Link</button>
+          </div>
+        </section>
+        <section class="modal-section">
+          <h4 data-i18n="pairedDevices">Paired Devices</h4>
+          <div id="paired-devices-list" class="device-list"></div>
+        </section>
+      </div>
+    </div>
+  </div>
+
   <div id="settings-modal" class="modal-backdrop hidden">
     <div class="modal-card">
       <div class="modal-header">
@@ -171,9 +217,18 @@
       </div>
       <div class="modal-body">
         <section class="modal-section">
+          <h4 data-i18n="liveCliConfig">Active Shared CLI Configs</h4>
+          <div id="active-cli-configs" class="active-cli-grid"></div>
+          <div class="import-actions">
+            <button id="btn-import-codex" class="mini-btn" type="button" data-i18n="importCodex">Import ~/.codex</button>
+            <button id="btn-import-claude" class="mini-btn" type="button" data-i18n="importClaude">Import ~/.claude</button>
+          </div>
+        </section>
+        <section class="modal-section">
           <h4 data-i18n="presetsTitle">Model Presets (real config sync)</h4>
           <div id="preset-list" class="preset-list"></div>
           <form id="preset-form" class="preset-form">
+            <input id="preset-id" type="hidden" />
             <input id="preset-name" placeholder="Name (e.g. Claude Sonnet)" required />
             <select id="preset-kind">
               <option value="claude_api">Claude API</option>
@@ -182,7 +237,10 @@
             <input id="preset-model" placeholder="Model ID" required />
             <input id="preset-base-url" placeholder="Base URL (optional)" />
             <input id="preset-api-key" type="password" placeholder="API Key (optional)" />
-            <button type="submit" class="btn-primary" data-i18n="savePreset">Save Preset</button>
+            <div class="preset-form-actions">
+              <button id="btn-save-preset" type="submit" class="btn-primary" data-i18n="savePreset">Save Preset</button>
+              <button id="btn-cancel-preset-edit" type="button" class="btn-ghost hidden" data-i18n="cancelEdit">Cancel Edit</button>
+            </div>
           </form>
         </section>
         <section class="modal-section">

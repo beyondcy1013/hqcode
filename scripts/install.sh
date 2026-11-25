@@ -152,6 +152,18 @@ if ! command -v tmux >/dev/null 2>&1; then
 fi
 
 if [[ "$NO_START" -eq 0 ]]; then
-  echo "Start HQCode with:"
-  echo "  ${INSTALL_DIR}/hqcode serve --addr 127.0.0.1:9900 --workspace \"\$(pwd)\""
+  if [[ ":${PATH}:" != *":${INSTALL_DIR}:"* ]]; then
+    echo "Note: ${INSTALL_DIR} is not in your current PATH."
+    echo "Add it to your shell profile or run:"
+    echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+    echo ""
+  fi
+  echo "Quick Start (local workstation):"
+  echo "  ${INSTALL_DIR}/hqcode serve --workspace \"\$(pwd)\""
+  echo ""
+  echo "Quick Start (phone QR pairing over LAN / Tailscale):"
+  echo "  ${INSTALL_DIR}/hqcode serve --lan --workspace \"\$(pwd)\""
+  echo ""
+  echo "Run diagnostics:"
+  echo "  ${INSTALL_DIR}/hqcode doctor"
 fi

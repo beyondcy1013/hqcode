@@ -45,6 +45,12 @@ impl AuthConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionClaims {
+    pub username: String,
+    pub device_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredCredentials {
     version: u8,
@@ -119,6 +125,28 @@ impl AuthService {
         self.initial_password_path().exists()
     }
 
+    pub fn read_initial_password(&self) -> Option<(String, String)> {
+        let path = self.initial_password_path();
+        if !matches!(hq_fs_atomic::validate_optional_regular(&path), Ok(true)) {
+            return None;
+        }
+        let content = fs::read_to_string(path).ok()?;
+        let mut username = None;
+        let mut password = None;
+        for line in content.lines() {
+            if let Some(u) = line.strip_prefix("username=") {
+                username = Some(u.trim().to_string());
+            } else if let Some(p) = line.strip_prefix("password=") {
+                password = Some(p.trim().to_string());
+            }
+        }
+        Some((username.unwrap_or_else(|| self.username()), password?))
+    }
+
+    pub fn clear_initial_password(&self) {
+        let _ = fs::remove_file(self.initial_password_path());
+    }
+
     pub fn verify_local_token(&self, candidate: &str) -> bool {
         let a = candidate.as_bytes();
         let b = self.local_api_token.as_bytes();
@@ -180,6 +208,32 @@ impl AuthService {
             .filter(|s| !s.is_empty())
             .unwrap_or(&current_username)
             .to_string();
+        self.persist_credentials_update(username, new_password)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn reset_password_direct(
+        &self,
+        new_username: Option<&str>,
+        new_password: &str,
+    ) -> Result<String> {
+        if new_password.len() < 8 {
+            bail!("new password must be at least 8 characters");
+        }
+        let _guard = self.password_update_lock.lock().await;
+        let current_username = self.username();
+        let username = new_username
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&current_username)
+            .to_string();
+        self.persist_credentials_update(username.clone(), new_password)
+            .await?;
+        Ok(username)
+    }
+
+    async fn persist_credentials_update(&self, username: String, new_password: &str) -> Result<()> {
         let new_pw = new_password.to_string();
         let password_hash = tokio::task::spawn_blocking(move || hash_argon2(&new_pw))
             .await
@@ -195,14 +249,33 @@ impl AuthService {
             .join(format!(".{}-credentials.json", self.config.file_prefix));
         hq_fs_atomic::write_private_json(&credentials_path, &updated)?;
         *self.credentials.write().unwrap_or_else(|p| p.into_inner()) = updated;
-        let _ = fs::remove_file(self.initial_password_path());
+        self.clear_initial_password();
         Ok(())
     }
 
     pub fn issue_session_cookie(&self, username: &str) -> Result<String> {
+        self.sign_session_payload(username, None)
+    }
+
+    pub fn issue_session_cookie_for_device(
+        &self,
+        username: &str,
+        device_id: &str,
+    ) -> Result<String> {
+        let trimmed = device_id.trim();
+        if trimmed.is_empty() || trimmed.contains(':') {
+            bail!("invalid device id for session cookie");
+        }
+        self.sign_session_payload(username, Some(trimmed))
+    }
+
+    fn sign_session_payload(&self, username: &str, device_id: Option<&str>) -> Result<String> {
         let now = now_unix_secs();
         let expires = now.saturating_add(self.config.session_ttl_days * 24 * 60 * 60);
-        let payload = format!("{username}:{expires}");
+        let payload = match device_id {
+            Some(did) => format!("{username}:{expires}:{did}"),
+            None => format!("{username}:{expires}"),
+        };
         let encoded_payload = URL_SAFE_NO_PAD.encode(payload.as_bytes());
         let sig = sign_payload(&self.session_secret, encoded_payload.as_bytes())?;
         let encoded_sig = URL_SAFE_NO_PAD.encode(sig);
@@ -210,6 +283,11 @@ impl AuthService {
     }
 
     pub fn verify_session_cookie(&self, token: &str) -> Option<String> {
+        self.verify_session_cookie_claims(token)
+            .map(|claims| claims.username)
+    }
+
+    pub fn verify_session_cookie_claims(&self, token: &str) -> Option<SessionClaims> {
         let (encoded_payload, encoded_sig) = token.split_once('.')?;
         let provided_sig = URL_SAFE_NO_PAD.decode(encoded_sig).ok()?;
         let expected_sig = sign_payload(&self.session_secret, encoded_payload.as_bytes()).ok()?;
@@ -220,15 +298,21 @@ impl AuthService {
         }
         let payload_bytes = URL_SAFE_NO_PAD.decode(encoded_payload).ok()?;
         let payload = String::from_utf8(payload_bytes).ok()?;
-        let (username, expires_str) = payload.rsplit_once(':')?;
-        let expires: u64 = expires_str.parse().ok()?;
-        if expires <= now_unix_secs() {
+        let mut parts = payload.split(':');
+        let username = parts.next()?.to_string();
+        let expires: u64 = parts.next()?.parse().ok()?;
+        let device_id = match (parts.next(), parts.next()) {
+            (None, None) => None,
+            (Some(did), None) if !did.is_empty() => Some(did.to_string()),
+            _ => return None,
+        };
+        if expires <= now_unix_secs() || username != self.username() {
             return None;
         }
-        if username != self.username() {
-            return None;
-        }
-        Some(username.to_string())
+        Some(SessionClaims {
+            username,
+            device_id,
+        })
     }
 
     pub fn build_set_cookie_header(&self, token: &str, secure: bool) -> String {
@@ -415,5 +499,32 @@ mod tests {
         );
         assert!(service.verify_local_token(service.local_api_token()));
         assert!(!service.verify_local_token("bad-token"));
+
+        let dev_cookie = service
+            .issue_session_cookie_for_device("admin", "dev-abc123")
+            .unwrap();
+        assert_eq!(
+            service.verify_session_cookie_claims(&dev_cookie),
+            Some(SessionClaims {
+                username: "admin".to_string(),
+                device_id: Some("dev-abc123".to_string()),
+            })
+        );
+        assert_eq!(
+            service.verify_session_cookie(&dev_cookie).as_deref(),
+            Some("admin")
+        );
+
+        let updated_user = service
+            .reset_password_direct(Some("rootadmin"), "reset-pass-999")
+            .await
+            .unwrap();
+        assert_eq!(updated_user, "rootadmin");
+        assert!(
+            service
+                .verify_login("rootadmin", "reset-pass-999")
+                .await
+                .unwrap()
+        );
     }
 }

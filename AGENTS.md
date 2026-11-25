@@ -10,8 +10,9 @@ HQCode is a public MIT-licensed, self-hosted Rust control plane for persistent `
   - `hq_runtime_paths`: dynamic OS user/passwd/$HOME resolution and thread-safe local time helpers.
   - `hq_workspace`: directory browsing boundaries (`allow_one_parent`) plus Git status, diff, revert, and commit operations.
   - `hq_tmux`: isolated `tmux` session lifecycle, `runuser -u USER -- SHELL -l` spawning, input pacing, and `portable-pty` backlog/broadcast streaming.
-  - `hq_auth`: Argon2id credentials, HMAC-SHA256 cookies, initial bootstrap password, and loopback Bearer tokens.
-  - `hq_presets`: CLI binary detection (`claude`, `codex`, `opencode`, `bash`) and real-config `apply`/`run` transactions.
+  - `hq_auth`: Argon2id credentials, HMAC-SHA256 cookies (including device-bound claims), initial bootstrap password, and loopback Bearer tokens.
+  - `hq_presets`: CLI binary detection (`claude`, `codex`, `opencode`, `bash`), real-config inspection/import, and `apply`/`run` transactions.
+  - `hq_remote_connect`: LAN/Tailscale/public endpoint discovery, one-time QR pairing tickets, SVG/terminal QR rendering, and revocable paired-device registry.
 - **Parameterization contract**: Keep shared crates free of application-specific ports, paths, cookie names, or `tmux` socket prefixes so HQCode and sibling applications can share them without runtime conflicts (HQCode defaults: bind `127.0.0.1:9900`, data dir `~/.hqcode`, `tmux` socket `hqcode_<session_id>`, cookie `hqcode_session`).
 
 ## Terminal I/O & Preset Semantics

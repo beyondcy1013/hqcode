@@ -9,7 +9,8 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parents[1]
-BINARY = ROOT / "target" / "release" / "hqcode"
+TARGET_BASE = Path(os.environ.get("CARGO_TARGET_DIR") or (ROOT / "target"))
+BINARY = TARGET_BASE / "release" / "hqcode"
 ASSETS_DIR = ROOT / "docs" / "assets"
 CHROMIUM = shutil.which("chromium") or "/home/codes/third_party/browser-tools/bin/chromium"
 PORT = 19901
@@ -182,6 +183,107 @@ def main() -> None:
             created_session_ids = [s["id"] for s in sessions_resp]
             assert len(created_session_ids) >= 1
 
+            # 3b. Two-click close confirmation prevents accidental session kill
+            page.click("#btn-new-shell")
+            page.wait_for_function(
+                "async () => (await (await fetch('/api/terminal/sessions')).json()).sessions.length === 2",
+                timeout=10000,
+            )
+            page.locator("#session-list .session-item .session-close-btn").nth(1).click()
+            page.wait_for_selector("#session-list .session-item .session-close-btn.confirming", timeout=5000)
+            after_first_click = page.evaluate(
+                "async () => (await (await fetch('/api/terminal/sessions')).json()).sessions"
+            )
+            assert len(after_first_click) == 2, "First click on close button must not kill session"
+            page.locator("#session-list .session-item .session-close-btn.confirming").click()
+            page.wait_for_function(
+                "async () => (await (await fetch('/api/terminal/sessions')).json()).sessions.length === 1",
+                timeout=10000,
+            )
+
+            # 3c. Remote QR Connect modal + unauthenticated mobile pairing + Enter send + geometry + revoke
+            page.click("#btn-open-connect")
+            page.wait_for_selector("#connect-modal:not(.hidden)", timeout=5000)
+            page.wait_for_selector("#connect-qr-svg svg", timeout=5000)
+            page.wait_for_selector("#connect-loopback-warn:not(.hidden)", timeout=5000)
+            pair_url = page.input_value("#connect-pair-url")
+            assert "/pair?code=" in pair_url, f"unexpected pair_url: {pair_url}"
+            page.click("#btn-close-connect")
+
+            paired_mobile_context = browser.new_context(
+                viewport={"width": 390, "height": 844},
+                has_touch=True,
+                is_mobile=True,
+                locale="en-US",
+            )
+            paired_page = paired_mobile_context.new_page()
+            paired_page.on("pageerror", lambda err: page_errors.append(str(err)))
+            paired_page.on(
+                "console",
+                lambda msg: console_errors.append(msg.text)
+                if msg.type == "error"
+                else None,
+            )
+            paired_page.goto(pair_url, wait_until="networkidle")
+            paired_page.wait_for_selector("#app-view:not(.hidden)", timeout=10000)
+            paired_page.wait_for_selector("#xterm-host:not(.hidden)", timeout=10000)
+            paired_page.wait_for_selector("#mobile-session-select", timeout=10000)
+            paired_page.wait_for_selector("#conn-pill.live", timeout=10000)
+            assert "code=" not in paired_page.url, f"pair code leaked in URL: {paired_page.url}"
+            time.sleep(0.4)
+
+            keys_box = paired_page.locator("#hq-mobile-keys").bounding_box()
+            term_box = paired_page.locator("#terminal-container").bounding_box()
+            brand_box = paired_page.locator(".brand-name").bounding_box()
+            connect_btn_box = paired_page.locator("#btn-open-connect").bounding_box()
+            diff_btn_box = paired_page.locator("#btn-open-diff").bounding_box()
+            logout_box = paired_page.locator("#btn-logout").bounding_box()
+            assert keys_box is not None and term_box is not None
+            assert brand_box is not None and connect_btn_box is not None and diff_btn_box is not None and logout_box is not None
+            assert brand_box["x"] + brand_box["width"] <= connect_btn_box["x"] + 1, (
+                f"mobile topbar overlap: brand={brand_box}, connect={connect_btn_box}"
+            )
+            assert connect_btn_box["x"] + connect_btn_box["width"] <= diff_btn_box["x"] + 1, (
+                f"mobile topbar overlap: connect={connect_btn_box}, diff={diff_btn_box}"
+            )
+            assert logout_box["x"] + logout_box["width"] <= 390, (
+                f"mobile logout overflows viewport: logout={logout_box}"
+            )
+            assert abs((keys_box["y"] + keys_box["height"]) - 844) <= 2, f"mobile keys bottom mismatch: {keys_box}"
+            assert term_box["y"] + term_box["height"] <= keys_box["y"] + 2, (
+                f"terminal overlaps mobile keys: term={term_box}, keys={keys_box}"
+            )
+
+            paired_page.fill("#mobile-quick-input", "echo HQCODE_MOBILE_OK")
+            paired_page.press("#mobile-quick-input", "Enter")
+            paired_page.wait_for_function(
+                """() => {
+                    const dom = document.querySelector('.xterm-rows')?.innerText || '';
+                    const t = window.__hqTerm;
+                    let bufText = '';
+                    if (t?.buffer?.active) {
+                        const b = t.buffer.active;
+                        for (let i = 0; i < b.length; i++) {
+                            bufText += (b.getLine(i)?.translateToString(true) || '') + '\\n';
+                        }
+                    }
+                    return dom.includes('HQCODE_MOBILE_OK') || bufText.includes('HQCODE_MOBILE_OK');
+                }""",
+                timeout=10000,
+            )
+            paired_page.screenshot(path=str(ASSETS_DIR / "screenshot-mobile.png"))
+            paired_page.close()
+
+            # Revoke paired device from desktop and confirm mobile context cookie immediately gets 401
+            page.click("#btn-open-connect")
+            page.wait_for_selector("#paired-devices-list .device-row button", timeout=5000)
+            page.click("#paired-devices-list .device-row button")
+            page.wait_for_selector("#paired-devices-list .device-row.revoked", timeout=5000)
+            page.click("#btn-close-connect")
+            revoked_resp = paired_mobile_context.request.get(f"http://127.0.0.1:{PORT}/api/system/info")
+            assert revoked_resp.status == 401, f"revoked device expected 401, got {revoked_resp.status}"
+            paired_mobile_context.close()
+
             # 4. Open Git Diff drawer, verify colorized lines & capture desktop screenshot
             page.click("#btn-open-diff")
             page.wait_for_selector("#diff-drawer:not(.hidden)", timeout=5000)
@@ -209,68 +311,9 @@ def main() -> None:
                 timeout=5000,
             )
 
-            # 6. Mobile viewport geometry & soft-key steer verification
-            mobile_context = browser.new_context(
-                viewport={"width": 390, "height": 844},
-                has_touch=True,
-                is_mobile=True,
-                locale="en-US",
-                storage_state=context.storage_state(),
-            )
-            mobile_page = mobile_context.new_page()
-            mobile_page.on("pageerror", lambda err: page_errors.append(str(err)))
-            mobile_page.on(
-                "console",
-                lambda msg: console_errors.append(msg.text)
-                if msg.type == "error"
-                else None,
-            )
-
-            mobile_page.goto(f"http://127.0.0.1:{PORT}/", wait_until="networkidle")
-            mobile_page.wait_for_selector("#hq-mobile-keys", timeout=10000)
-            mobile_page.wait_for_selector("#xterm-host:not(.hidden)", timeout=10000)
-            time.sleep(0.4)
-
-            keys_box = mobile_page.locator("#hq-mobile-keys").bounding_box()
-            term_box = mobile_page.locator("#terminal-container").bounding_box()
-            brand_box = mobile_page.locator(".brand-name").bounding_box()
-            diff_btn_box = mobile_page.locator("#btn-open-diff").bounding_box()
-            logout_box = mobile_page.locator("#btn-logout").bounding_box()
-            assert keys_box is not None and term_box is not None
-            assert brand_box is not None and diff_btn_box is not None and logout_box is not None
-            assert brand_box["x"] + brand_box["width"] <= diff_btn_box["x"] + 1, (
-                f"mobile topbar overlap: brand={brand_box}, diff={diff_btn_box}"
-            )
-            assert logout_box["x"] + logout_box["width"] <= 390, (
-                f"mobile logout overflows viewport: logout={logout_box}"
-            )
-            assert abs((keys_box["y"] + keys_box["height"]) - 844) <= 2, f"mobile keys bottom mismatch: {keys_box}"
-            assert term_box["y"] + term_box["height"] <= keys_box["y"] + 2, (
-                f"terminal overlaps mobile keys: term={term_box}, keys={keys_box}"
-            )
-
-            mobile_page.fill("#mobile-quick-input", "echo HQCODE_MOBILE_OK")
-            mobile_page.click("#btn-mobile-send")
-            mobile_page.wait_for_function(
-                """() => {
-                    const dom = document.querySelector('.xterm-rows')?.innerText || '';
-                    const t = window.__hqTerm;
-                    let bufText = '';
-                    if (t?.buffer?.active) {
-                        const b = t.buffer.active;
-                        for (let i = 0; i < b.length; i++) {
-                            bufText += (b.getLine(i)?.translateToString(true) || '') + '\\n';
-                        }
-                    }
-                    return dom.includes('HQCODE_MOBILE_OK') || bufText.includes('HQCODE_MOBILE_OK');
-                }""",
-                timeout=10000,
-            )
-            mobile_page.screenshot(path=str(ASSETS_DIR / "screenshot-mobile.png"))
-
-            # 7. Close sessions through UI and verify tmux cleanup
+            # 6. Close sessions through API and verify tmux cleanup
             for sid in created_session_ids:
-                mobile_page.evaluate(
+                page.evaluate(
                     f"async () => await fetch('/api/terminal/sessions/{sid}', {{ method: 'DELETE' }})"
                 )
             time.sleep(0.3)

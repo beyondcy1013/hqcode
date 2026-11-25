@@ -67,10 +67,18 @@ curl -fsSL https://raw.githubusercontent.com/beyondcy1013/hqcode/main/scripts/in
 Start HQCode on your workstation or private server:
 
 ```bash
-hqcode serve --addr 127.0.0.1:9900 --workspace /path/to/your/projects
+# Local workstation only (shows initial credentials in terminal)
+hqcode serve --workspace /path/to/your/projects
+
+# Enable LAN / Tailscale access + print scannable phone QR pairing code
+hqcode serve --lan --workspace /path/to/your/projects
 ```
 
-On first launch, HQCode generates an owner-only (`0600`) bootstrap password at `~/.hqcode/.hqcode-initial-password`. Sign in once and the initial password file is automatically deleted.
+- **Phone QR Connect**: Scan the startup terminal QR code—or click **📱 Connect** in the top bar—to pair your phone once via `/pair?code=...` without typing passwords, and revoke paired devices anytime.
+- **Zero-Friction CLI Utilities**:
+  - `hqcode pair`: Print a fresh one-time phone pairing QR code in your terminal for a running server.
+  - `hqcode doctor`: Verify `tmux`, `git`, installed Coding Agents, `PATH`, and reachable LAN/Tailscale URLs.
+  - `hqcode passwd`: Reset your login password directly from the workstation CLI.
 
 ### 2. Build from Source
 
@@ -115,6 +123,7 @@ flowchart LR
     Server --> Tmux["hq_tmux<br/>portable-pty + tmux -L hqcode_*"]
     Tmux --> Agents["Native CLI Agents<br/>Claude Code / Codex / OpenCode / Shell"]
     Server --> Presets["hq_presets<br/>Real Config Transactions"]
+    Server --> Remote["hq_remote_connect<br/>QR Pairing + Device Revoke"]
 ```
 
 HQCode's `crates/*` are fully parameterized (`TmuxNamespace`, `AuthConfig`, `WorkspaceConfig`) and shared cleanly across compatible control planes. See [docs/SHARED_CORE_ARCHITECTURE.md](docs/SHARED_CORE_ARCHITECTURE.md).

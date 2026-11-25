@@ -1,6 +1,6 @@
 # Shared Core Architecture & Multi-Instance Isolation
 
-HQCode is structured as a thin binary (`src/`) on top of **6 parameterized workspace crates** (`crates/*`) so both **HQCode** (public MIT control plane) and **`webClx`** (private heavy-ops control plane) can share the same foundational engine without code duplication or runtime conflicts.
+HQCode is structured as a thin binary (`src/`) on top of **7 parameterized workspace crates** (`crates/*`) so both **HQCode** (public MIT control plane) and **`webClx`** (private heavy-ops control plane) can share the same foundational engine without code duplication or runtime conflicts.
 
 ## Shared Crates (`crates/*`)
 
@@ -10,8 +10,9 @@ HQCode is structured as a thin binary (`src/`) on top of **6 parameterized works
 | `hq_runtime_paths` | Unix `passwd` / `$HOME` dynamic user resolution & thread-safe local time | `resolve_data_dir(env_var, dir_name)`, `resolve_workspace_dir(env_var)` |
 | `hq_workspace` | Workspace path boundary (`allow_one_parent`) + Git status/diff/revert/commit | Accepts any `WorkspaceConfig` |
 | `hq_tmux` | Isolated `tmux` lifecycle, `runuser -u USER -- SHELL -l`, 5ms erase-key pacing, `portable-pty` backlog & broadcast | Parameterized via `TmuxNamespace { socket_prefix, session_prefix, scope_unit_prefix, after_service }` |
-| `hq_auth` | Argon2id credentials, HMAC-SHA256 cookies, initial bootstrap password, loopback Bearer token | Parameterized via `AuthConfig { cookie_name, file_prefix, default_username, session_ttl_days }` |
-| `hq_presets` | CLI binary detection (`claude`, `codex`, `opencode`, `bash`) & real-config `apply`/`run` transactions | Parameterized store file prefix; zero `CODEX_HOME`/`CLAUDE_CONFIG_DIR` env injection |
+| `hq_auth` | Argon2id credentials, HMAC-SHA256 cookies (incl. device-bound claims), initial bootstrap password, loopback Bearer token | Parameterized via `AuthConfig { cookie_name, file_prefix, default_username, session_ttl_days }` |
+| `hq_presets` | CLI binary detection (`claude`, `codex`, `opencode`, `bash`), real-config inspection/import & `apply`/`run` transactions | Parameterized store file prefix; zero `CODEX_HOME`/`CLAUDE_CONFIG_DIR` env injection |
+| `hq_remote_connect` | LAN/Tailscale/public endpoint discovery, one-time QR pairing tickets, SVG/terminal QR rendering & revocable paired-device registry | Parameterized via `RemoteConnectConfig { file_prefix, pair_path, default_ttl_secs, max_active_tickets }` |
 
 ## Side-by-Side Runtime Isolation (`HQCode` + `webClx`)
 

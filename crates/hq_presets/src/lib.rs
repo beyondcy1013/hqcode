@@ -44,6 +44,21 @@ pub struct DetectedAgent {
     pub available: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveCliConfigSummary {
+    pub configured: bool,
+    pub model: String,
+    pub base_url: String,
+    pub has_api_key: bool,
+    pub config_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveCliConfigs {
+    pub codex: ActiveCliConfigSummary,
+    pub claude: ActiveCliConfigSummary,
+}
+
 pub fn detect_installed_agents() -> Vec<DetectedAgent> {
     let candidates = [
         ("claude", "Claude Code", "claude"),
@@ -134,6 +149,10 @@ impl PresetStore {
         {
             let mut list = self.presets.write().unwrap_or_else(|p| p.into_inner());
             if let Some(existing) = list.iter_mut().find(|p| p.id == preset.id) {
+                let incoming_key = preset.api_key.trim();
+                if incoming_key.is_empty() || incoming_key == "********" {
+                    preset.api_key = existing.api_key.clone();
+                }
                 *existing = preset.clone();
             } else {
                 list.push(preset.clone());
@@ -315,6 +334,208 @@ fn apply_claude_preset(user_home: &Path, preset: &ModelPreset) -> Result<()> {
     Ok(())
 }
 
+struct ParsedCodexConfig {
+    configured: bool,
+    model: String,
+    base_url: String,
+    wire_api: String,
+    api_key: String,
+    config_path: PathBuf,
+}
+
+fn read_codex_active_config(user_home: &Path) -> ParsedCodexConfig {
+    let codex_dir = user_home.join(".codex");
+    let config_path = codex_dir.join("config.toml");
+    let auth_path = codex_dir.join("auth.json");
+    let mut model = String::new();
+    let mut base_url = String::new();
+    let mut wire_api = String::new();
+    let mut api_key = String::new();
+
+    if let Ok(raw) = fs::read_to_string(&config_path)
+        && let Ok(doc) = raw.parse::<toml_edit::DocumentMut>()
+    {
+        if let Some(m) = doc.get("model").and_then(|v| v.as_str()) {
+            model = m.trim().to_string();
+        }
+        let provider_id = doc
+            .get("model_provider")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(pid) = provider_id
+            && let Some(providers) = doc.get("model_providers").and_then(|v| v.as_table())
+            && let Some(tbl) = providers.get(pid).and_then(|v| v.as_table())
+        {
+            base_url = tbl
+                .get("base_url")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+            wire_api = tbl
+                .get("wire_api")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+        }
+    }
+
+    if let Ok(bytes) = fs::read(&auth_path)
+        && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        && let Some(k) = val.get("OPENAI_API_KEY").and_then(|v| v.as_str())
+    {
+        api_key = k.trim().to_string();
+    }
+
+    let configured = !model.is_empty() || !base_url.is_empty() || !api_key.is_empty();
+    ParsedCodexConfig {
+        configured,
+        model,
+        base_url,
+        wire_api,
+        api_key,
+        config_path,
+    }
+}
+
+struct ParsedClaudeConfig {
+    configured: bool,
+    model: String,
+    base_url: String,
+    api_key: String,
+    config_path: PathBuf,
+}
+
+fn read_claude_active_config(user_home: &Path) -> ParsedClaudeConfig {
+    let config_path = user_home.join(".claude").join("settings.json");
+    let mut model = String::new();
+    let mut base_url = String::new();
+    let mut api_key = String::new();
+
+    if let Ok(bytes) = fs::read(&config_path)
+        && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        && let Some(env_map) = val.get("env").and_then(|v| v.as_object())
+    {
+        model = env_map
+            .get("ANTHROPIC_MODEL")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        base_url = env_map
+            .get("ANTHROPIC_BASE_URL")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        api_key = env_map
+            .get("ANTHROPIC_AUTH_TOKEN")
+            .or_else(|| env_map.get("ANTHROPIC_API_KEY"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+    }
+
+    let configured = !model.is_empty() || !base_url.is_empty() || !api_key.is_empty();
+    ParsedClaudeConfig {
+        configured,
+        model,
+        base_url,
+        api_key,
+        config_path,
+    }
+}
+
+pub fn inspect_active_configs(user_home: &Path) -> ActiveCliConfigs {
+    let codex = read_codex_active_config(user_home);
+    let claude = read_claude_active_config(user_home);
+    ActiveCliConfigs {
+        codex: ActiveCliConfigSummary {
+            configured: codex.configured,
+            model: codex.model,
+            base_url: codex.base_url,
+            has_api_key: !codex.api_key.is_empty(),
+            config_path: codex.config_path.to_string_lossy().into_owned(),
+        },
+        claude: ActiveCliConfigSummary {
+            configured: claude.configured,
+            model: claude.model,
+            base_url: claude.base_url,
+            has_api_key: !claude.api_key.is_empty(),
+            config_path: claude.config_path.to_string_lossy().into_owned(),
+        },
+    }
+}
+
+pub fn import_current_config(
+    kind: PresetKind,
+    user_home: &Path,
+    custom_name: Option<&str>,
+) -> Result<ModelPreset> {
+    let custom = custom_name.map(str::trim).filter(|s| !s.is_empty());
+    match kind {
+        PresetKind::CodexApi => {
+            let parsed = read_codex_active_config(user_home);
+            if !parsed.configured {
+                bail!(
+                    "no Codex configuration found in {}",
+                    parsed.config_path.display()
+                );
+            }
+            let model = if parsed.model.is_empty() {
+                "gpt-5".to_string()
+            } else {
+                parsed.model
+            };
+            let name = custom
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("Codex ({model})"));
+            Ok(ModelPreset {
+                id: String::new(),
+                name,
+                kind: PresetKind::CodexApi,
+                model,
+                base_url: parsed.base_url,
+                api_key: parsed.api_key,
+                wire_api: if parsed.wire_api.is_empty() {
+                    "responses".to_string()
+                } else {
+                    parsed.wire_api
+                },
+            })
+        }
+        PresetKind::ClaudeApi => {
+            let parsed = read_claude_active_config(user_home);
+            if !parsed.configured {
+                bail!(
+                    "no Claude configuration found in {}",
+                    parsed.config_path.display()
+                );
+            }
+            let model = if parsed.model.is_empty() {
+                "claude-sonnet".to_string()
+            } else {
+                parsed.model
+            };
+            let name = custom
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("Claude ({model})"));
+            Ok(ModelPreset {
+                id: String::new(),
+                name,
+                kind: PresetKind::ClaudeApi,
+                model,
+                base_url: parsed.base_url,
+                api_key: parsed.api_key,
+                wire_api: String::new(),
+            })
+        }
+    }
+}
+
 /// Applies `preset` to the real shared configuration under `user_home`, spawns
 /// `cmd_args` natively (never injecting `CODEX_HOME` or `CLAUDE_CONFIG_DIR`),
 /// restores the original configuration after `settle_delay` (or when the child
@@ -457,5 +678,59 @@ mod tests {
     fn detect_installed_agents_includes_shell() {
         let agents = detect_installed_agents();
         assert!(agents.iter().any(|a| a.id == "shell" && a.available));
+    }
+
+    #[test]
+    fn inspect_and_import_active_configs_and_preserve_api_key_on_edit() {
+        let home = TempHome::new("inspect");
+        let store = PresetStore::load(&home.0, "hqcode");
+        let empty = inspect_active_configs(&home.0);
+        assert!(!empty.codex.configured);
+        assert!(!empty.claude.configured);
+
+        let codex_preset = ModelPreset {
+            id: "cx-1".to_string(),
+            name: "Codex Live".to_string(),
+            kind: PresetKind::CodexApi,
+            model: "gpt-5.4".to_string(),
+            base_url: "https://codex.example.com/v1".to_string(),
+            api_key: "sk-secret-codex".to_string(),
+            wire_api: "responses".to_string(),
+        };
+        let claude_preset = ModelPreset {
+            id: "cl-1".to_string(),
+            name: "Claude Live".to_string(),
+            kind: PresetKind::ClaudeApi,
+            model: "claude-sonnet-4".to_string(),
+            base_url: "https://claude.example.com".to_string(),
+            api_key: "sk-secret-claude".to_string(),
+            wire_api: String::new(),
+        };
+        apply_preset(&home.0, &codex_preset).unwrap();
+        apply_preset(&home.0, &claude_preset).unwrap();
+
+        let inspected = inspect_active_configs(&home.0);
+        assert!(inspected.codex.configured);
+        assert_eq!(inspected.codex.model, "gpt-5.4");
+        assert!(inspected.codex.has_api_key);
+        assert!(inspected.claude.configured);
+        assert_eq!(inspected.claude.model, "claude-sonnet-4");
+        assert!(inspected.claude.has_api_key);
+
+        let imported_cx = import_current_config(PresetKind::CodexApi, &home.0, None).unwrap();
+        assert_eq!(imported_cx.api_key, "sk-secret-codex");
+        let imported_cl =
+            import_current_config(PresetKind::ClaudeApi, &home.0, Some("My Claude")).unwrap();
+        assert_eq!(imported_cl.name, "My Claude");
+        assert_eq!(imported_cl.api_key, "sk-secret-claude");
+
+        let saved = store.upsert(codex_preset).unwrap();
+        let mut edited = saved.clone();
+        edited.model = "gpt-5.4-turbo".to_string();
+        edited.api_key = "********".to_string();
+        store.upsert(edited).unwrap();
+        let reloaded = store.resolve(&saved.id).unwrap();
+        assert_eq!(reloaded.model, "gpt-5.4-turbo");
+        assert_eq!(reloaded.api_key, "sk-secret-codex");
     }
 }

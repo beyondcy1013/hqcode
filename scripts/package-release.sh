@@ -58,10 +58,11 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
   fi
 fi
 
+TARGET_BASE="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
 if [[ -n "$TARGET_TRIPLE" ]]; then
-  BIN_PATH="$ROOT_DIR/target/${TARGET_TRIPLE}/release/hqcode"
+  BIN_PATH="$TARGET_BASE/${TARGET_TRIPLE}/release/hqcode"
 else
-  BIN_PATH="$ROOT_DIR/target/release/hqcode"
+  BIN_PATH="$TARGET_BASE/release/hqcode"
 fi
 if [[ ! -f "$BIN_PATH" ]]; then
   echo "Release binary missing: $BIN_PATH" >&2

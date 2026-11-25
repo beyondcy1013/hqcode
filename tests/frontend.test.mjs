@@ -49,6 +49,9 @@ test('escapeHtml neutralizes HTML injection characters', () => {
 test('MOBILE_KEY_MAP contains essential control sequences', () => {
   assert.equal(MOBILE_KEY_MAP.esc, '\x1b');
   assert.equal(MOBILE_KEY_MAP.ctrlc, '\x03');
+  assert.equal(MOBILE_KEY_MAP.ctrld, '\x04');
+  assert.equal(MOBILE_KEY_MAP.left, '\x1b[D');
+  assert.equal(MOBILE_KEY_MAP.right, '\x1b[C');
   assert.equal(MOBILE_KEY_MAP.approve, 'y\r');
   assert.equal(MOBILE_KEY_MAP.reject, 'n\r');
 });

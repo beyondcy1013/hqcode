@@ -1,6 +1,6 @@
 use std::{
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::Instant,
 };
@@ -10,17 +10,24 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{
-        ConnectInfo, Path as AxumPath, Query, Request, State, WebSocketUpgrade,
+        ConnectInfo, FromRequestParts, Path as AxumPath, Query, Request, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header, request::Parts},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post, put},
 };
 use futures_util::{SinkExt, StreamExt};
 use hq_auth::{AuthConfig, AuthService};
-use hq_presets::{DetectedAgent, ModelPreset, PresetStore, apply_preset, detect_installed_agents};
+use hq_presets::{
+    DetectedAgent, ModelPreset, PresetKind, PresetStore, apply_preset, detect_installed_agents,
+    import_current_config, inspect_active_configs,
+};
+use hq_remote_connect::{
+    EndpointKind, RemoteConnectConfig, RemoteConnectService, discover_endpoints,
+    preferred_phone_endpoint,
+};
 use hq_runtime_paths::resolve_current_user;
 use hq_tmux::{CreateSessionRequest, TerminalManager, TerminalStreamEvent, TmuxNamespace};
 use hq_workspace::{
@@ -48,6 +55,9 @@ pub struct AppState {
     pub terminal: TerminalManager,
     pub presets: PresetStore,
     pub user_home: PathBuf,
+    pub bind_addr: SocketAddr,
+    pub public_url: Option<String>,
+    pub remote: RemoteConnectService,
 }
 
 #[derive(Debug)]
@@ -98,7 +108,13 @@ impl IntoResponse for AppError {
 
 type ApiResult<T> = std::result::Result<T, AppError>;
 
-pub async fn serve(addr: SocketAddr, data_dir: PathBuf, workspace_dir: PathBuf) -> Result<()> {
+pub async fn serve(
+    addr: SocketAddr,
+    data_dir: PathBuf,
+    workspace_dir: PathBuf,
+    public_url: Option<String>,
+    no_qr: bool,
+) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -114,6 +130,8 @@ pub async fn serve(addr: SocketAddr, data_dir: PathBuf, workspace_dir: PathBuf) 
         .unwrap_or_else(|_| user_profile.home.clone());
 
     let auth = AuthService::initialize(&data_dir, AuthConfig::for_app("hqcode"))?;
+    let remote =
+        RemoteConnectService::initialize(&data_dir, RemoteConnectConfig::for_app("hqcode"))?;
     let terminal = TerminalManager::new(
         TmuxNamespace::new("hqcode"),
         data_dir.join("hqcode-sessions.json"),
@@ -130,6 +148,11 @@ pub async fn serve(addr: SocketAddr, data_dir: PathBuf, workspace_dir: PathBuf) 
         allow_one_parent: true,
     };
 
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind {addr}"))?;
+    let actual_addr = listener.local_addr()?;
+
     let state = AppState {
         version: env!("CARGO_PKG_VERSION").to_string(),
         started_at: Instant::now(),
@@ -139,12 +162,10 @@ pub async fn serve(addr: SocketAddr, data_dir: PathBuf, workspace_dir: PathBuf) 
         terminal,
         presets,
         user_home,
+        bind_addr: actual_addr,
+        public_url: public_url.clone(),
+        remote: remote.clone(),
     };
-
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind {addr}"))?;
-    let actual_addr = listener.local_addr()?;
 
     info!(
         "HQCode v{} listening on http://{}",
@@ -152,12 +173,16 @@ pub async fn serve(addr: SocketAddr, data_dir: PathBuf, workspace_dir: PathBuf) 
     );
     info!("workspace: {}", canonical_workspace.display());
     info!("data dir: {}", data_dir.display());
-    if auth.has_initial_password_pending() {
-        info!(
-            "initial credentials written to {}",
-            auth.initial_password_path().display()
-        );
-    }
+    print_startup_banner(
+        &state.version,
+        actual_addr,
+        public_url.as_deref(),
+        &canonical_workspace,
+        &data_dir,
+        &auth,
+        &remote,
+        no_qr,
+    );
 
     let app = build_router(state);
     axum::serve(
@@ -166,6 +191,54 @@ pub async fn serve(addr: SocketAddr, data_dir: PathBuf, workspace_dir: PathBuf) 
     )
     .await
     .context("server exited with error")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_startup_banner(
+    version: &str,
+    bind_addr: SocketAddr,
+    public_url: Option<&str>,
+    workspace: &Path,
+    data_dir: &Path,
+    auth: &AuthService,
+    remote: &RemoteConnectService,
+    no_qr: bool,
+) {
+    let endpoints = discover_endpoints(bind_addr, public_url);
+    println!("\n=== HQCode v{version} ========================================");
+    println!("  Local WebUI : http://127.0.0.1:{}", bind_addr.port());
+    for ep in &endpoints {
+        if ep.kind != EndpointKind::Loopback {
+            println!("  {:<12}: {}", ep.label, ep.url);
+        }
+    }
+    println!("  Workspace   : {}", workspace.display());
+    println!("  Data Dir    : {}", data_dir.display());
+    if let Some((user, pw)) = auth.read_initial_password() {
+        println!("  First Login : username=`{user}`  password=`{pw}`");
+        println!("  Note        : initial password file is deleted after first login.");
+    }
+    if !no_qr {
+        if let Some(phone_ep) = preferred_phone_endpoint(&endpoints) {
+            match remote.issue_ticket(&phone_ep.url, Some("CLI Startup"), Some(600)) {
+                Ok(issued) => {
+                    println!(
+                        "\n  Phone QR Pairing (one-time, valid 10m) -> {}:",
+                        issued.ticket.pair_url
+                    );
+                    println!("{}", issued.qr_terminal);
+                }
+                Err(err) => {
+                    warn!("failed to generate startup QR code: {err}");
+                }
+            }
+        } else {
+            println!(
+                "  Phone QR    : loopback-only mode; restart with `--lan` or `--public-url <URL>` to scan from phone."
+            );
+        }
+    }
+    println!("============================================================\n");
 }
 
 fn resolve_static_dir() -> PathBuf {
@@ -207,22 +280,43 @@ pub fn build_router(state: AppState) -> Router {
             "/api/presets",
             get(api_list_presets).post(api_upsert_preset),
         )
+        .route("/api/presets/active", get(api_active_presets))
+        .route("/api/presets/import", post(api_import_preset))
         .route("/api/presets/{id}", delete(api_delete_preset))
         .route("/api/presets/{id}/apply", post(api_apply_preset))
+        .route("/api/remote/status", get(api_remote_status))
+        .route("/api/remote/tickets", post(api_remote_issue_ticket))
+        .route("/api/remote/tickets/{id}", delete(api_remote_revoke_ticket))
+        .route("/api/remote/devices/{id}", delete(api_remote_revoke_device))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     Router::new()
         .route("/", get(serve_index))
         .route("/login", get(serve_index))
+        .route("/pair", get(serve_index))
         .route("/favicon.ico", get(serve_favicon))
         .route("/static/{*path}", get(serve_static))
         .route("/api/health", get(api_health))
         .route("/api/auth/session", get(api_auth_session))
         .route("/api/auth/login", post(api_login))
+        .route("/api/remote/redeem", post(api_remote_redeem))
         .merge(protected)
         .fallback(get(serve_index))
         .layer(CompressionLayer::new())
         .with_state(state)
+}
+
+fn verify_cookie_is_active(state: &AppState, token: &str) -> bool {
+    let Some(claims) = state.auth.verify_session_cookie_claims(token) else {
+        return false;
+    };
+    if let Some(ref did) = claims.device_id {
+        if !state.remote.is_device_active(did) {
+            return false;
+        }
+        state.remote.touch_device(did);
+    }
+    true
 }
 
 async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
@@ -245,7 +339,7 @@ async fn require_auth(State(state): State<AppState>, request: Request, next: Nex
 
     if let Some(cookie_hdr) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok())
         && let Some(token) = state.auth.extract_cookie_value(cookie_hdr)
-        && state.auth.verify_session_cookie(token).is_some()
+        && verify_cookie_is_active(&state, token)
     {
         return next.run(request).await;
     }
@@ -373,8 +467,7 @@ async fn api_auth_session(
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
         .and_then(|cookie| state.auth.extract_cookie_value(cookie))
-        .and_then(|token| state.auth.verify_session_cookie(token))
-        .is_some();
+        .is_some_and(|token| verify_cookie_is_active(&state, token));
 
     Json(AuthSessionStatus {
         authenticated,
@@ -963,6 +1056,195 @@ async fn api_apply_preset(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+async fn api_active_presets(State(state): State<AppState>) -> Json<hq_presets::ActiveCliConfigs> {
+    Json(inspect_active_configs(&state.user_home))
+}
+
+#[derive(Deserialize)]
+struct ImportPresetRequest {
+    kind: PresetKind,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+async fn api_import_preset(
+    State(state): State<AppState>,
+    Json(payload): Json<ImportPresetRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let imported = import_current_config(payload.kind, &state.user_home, payload.name.as_deref())
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    let mut saved = state
+        .presets
+        .upsert(imported)
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    if !saved.api_key.is_empty() {
+        saved.api_key = "********".to_string();
+    }
+    Ok(Json(serde_json::json!({ "preset": saved })))
+}
+
+struct OptionalPeerAddr(Option<SocketAddr>);
+
+impl<S> FromRequestParts<S> for OptionalPeerAddr
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        let addr = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0);
+        Ok(Self(addr))
+    }
+}
+
+#[derive(Deserialize)]
+struct IssueTicketRequest {
+    #[serde(default)]
+    endpoint_url: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    ttl_secs: Option<u64>,
+}
+
+async fn api_remote_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let endpoints = discover_endpoints(state.bind_addr, state.public_url.as_deref());
+    let is_loopback_only = endpoints.iter().all(|e| !e.reachable_from_phone);
+    Json(serde_json::json!({
+        "bind_addr": state.bind_addr.to_string(),
+        "is_loopback_only": is_loopback_only,
+        "public_url": state.public_url,
+        "endpoints": endpoints,
+        "active_tickets": state.remote.list_active_tickets(),
+        "devices": state.remote.list_devices(),
+    }))
+}
+
+async fn api_remote_issue_ticket(
+    State(state): State<AppState>,
+    Json(payload): Json<IssueTicketRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let endpoints = discover_endpoints(state.bind_addr, state.public_url.as_deref());
+    let chosen_url = payload
+        .endpoint_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| preferred_phone_endpoint(&endpoints).map(|ep| ep.url.clone()))
+        .or_else(|| endpoints.first().map(|ep| ep.url.clone()))
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}", state.bind_addr.port()));
+
+    let issued = state
+        .remote
+        .issue_ticket(&chosen_url, payload.label.as_deref(), payload.ttl_secs)
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "ticket": issued.ticket,
+        "pair_url": issued.ticket.pair_url,
+        "qr_svg": issued.qr_svg,
+        "qr_terminal": issued.qr_terminal,
+        "expires_in_secs": issued.ticket.expires_in_secs,
+    })))
+}
+
+async fn api_remote_revoke_ticket(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let revoked = state.remote.revoke_ticket(&id);
+    if !revoked {
+        return Err(AppError::not_found("pairing ticket not found"));
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn api_remote_revoke_device(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let revoked = state
+        .remote
+        .revoke_device(&id)
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    if !revoked {
+        return Err(AppError::not_found("paired device not found"));
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct RedeemTicketRequest {
+    code: String,
+    #[serde(default)]
+    device_name: Option<String>,
+}
+
+async fn api_remote_redeem(
+    State(state): State<AppState>,
+    OptionalPeerAddr(peer_addr): OptionalPeerAddr,
+    headers: HeaderMap,
+    Json(payload): Json<RedeemTicketRequest>,
+) -> ApiResult<Response> {
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let is_loopback_peer = peer_addr.is_some_and(|a| a.ip().is_loopback());
+    let remote_ip = if is_loopback_peer {
+        headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| peer_addr.map(|a| a.ip().to_string()).unwrap_or_default())
+    } else {
+        peer_addr.map(|a| a.ip().to_string()).unwrap_or_default()
+    };
+
+    let device = state
+        .remote
+        .redeem_ticket(
+            &payload.code,
+            payload.device_name.as_deref(),
+            user_agent,
+            &remote_ip,
+        )
+        .map_err(|e| AppError::unauthorized(e.to_string()))?;
+
+    let username = state.auth.username();
+    let token = state
+        .auth
+        .issue_session_cookie_for_device(&username, &device.id)
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    state.auth.clear_initial_password();
+
+    let is_https = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|p| p.eq_ignore_ascii_case("https"));
+
+    let mut resp = Json(serde_json::json!({
+        "ok": true,
+        "username": username,
+        "device": device,
+    }))
+    .into_response();
+    if let Ok(val) = HeaderValue::from_str(&state.auth.build_set_cookie_header(&token, is_https)) {
+        resp.headers_mut().insert(header::SET_COOKIE, val);
+    }
+    Ok(resp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -980,6 +1262,9 @@ mod tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         let user = resolve_current_user().unwrap();
         let auth = AuthService::initialize(&data_dir, AuthConfig::for_app("hqcode")).unwrap();
+        let remote =
+            RemoteConnectService::initialize(&data_dir, RemoteConnectConfig::for_app("hqcode"))
+                .unwrap();
         let state = AppState {
             version: "0.1.0".to_string(),
             started_at: Instant::now(),
@@ -994,6 +1279,9 @@ mod tests {
             ),
             presets: PresetStore::load(&data_dir, "hqcode"),
             user_home: user.home,
+            bind_addr: "127.0.0.1:9900".parse().unwrap(),
+            public_url: None,
+            remote,
         };
         let app = build_router(state);
 
@@ -1051,6 +1339,7 @@ mod tests {
         assert_eq!(search.status(), StatusCode::OK);
 
         let git_st = app
+            .clone()
             .oneshot(
                 HttpRequest::builder()
                     .uri("/api/git/status?path=.")
@@ -1061,6 +1350,117 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(git_st.status(), StatusCode::OK);
+
+        // Remote QR pairing end-to-end closed loop: issue -> redeem -> auth OK -> replay rejected -> device revoke -> 401.
+        let issue_resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/remote/tickets")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"endpoint_url":"http://192.168.1.9:9900","label":"Phone"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(issue_resp.status(), StatusCode::OK);
+        let issue_bytes = axum::body::to_bytes(issue_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let issue_json: serde_json::Value = serde_json::from_slice(&issue_bytes).unwrap();
+        let pair_url = issue_json["pair_url"].as_str().unwrap();
+        let code = pair_url.split("code=").nth(1).unwrap().to_string();
+        assert!(issue_json["qr_svg"].as_str().unwrap().contains("<svg"));
+
+        let redeem_resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/remote/redeem")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::USER_AGENT, "iPhone Safari")
+                    .body(Body::from(format!(r#"{{"code":"{code}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(redeem_resp.status(), StatusCode::OK);
+        let set_cookie = redeem_resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let redeem_bytes = axum::body::to_bytes(redeem_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let redeem_json: serde_json::Value = serde_json::from_slice(&redeem_bytes).unwrap();
+        let device_id = redeem_json["device"]["id"].as_str().unwrap().to_string();
+
+        // Paired device cookie accesses protected API.
+        let paired_sys = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/system/info")
+                    .header(header::COOKIE, &set_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(paired_sys.status(), StatusCode::OK);
+
+        // Replaying the one-time code fails.
+        let replay_resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/remote/redeem")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"code":"{code}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay_resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Revoking the device immediately invalidates its cookie.
+        let revoke_resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/remote/devices/{device_id}"))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoke_resp.status(), StatusCode::OK);
+
+        let revoked_sys = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/system/info")
+                    .header(header::COOKIE, &set_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked_sys.status(), StatusCode::UNAUTHORIZED);
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }
