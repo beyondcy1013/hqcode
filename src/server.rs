@@ -214,6 +214,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(serve_index))
         .route("/login", get(serve_index))
+        .route("/favicon.ico", get(serve_favicon))
         .route("/static/{*path}", get(serve_static))
         .route("/api/health", get(api_health))
         .route("/api/auth/session", get(api_auth_session))
@@ -273,12 +274,20 @@ async fn serve_index(State(state): State<AppState>) -> Response {
     resp
 }
 
+async fn serve_favicon(State(state): State<AppState>, req_headers: HeaderMap) -> Response {
+    serve_static_asset(&state, "favicon.ico", &req_headers).await
+}
+
 async fn serve_static(
     State(state): State<AppState>,
     AxumPath(asset_path): AxumPath<String>,
     req_headers: HeaderMap,
 ) -> Response {
     let clean = asset_path.trim_start_matches('/');
+    serve_static_asset(&state, clean, &req_headers).await
+}
+
+async fn serve_static_asset(state: &AppState, clean: &str, req_headers: &HeaderMap) -> Response {
     if clean.is_empty() || clean.contains("..") {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -328,6 +337,8 @@ fn content_type_for(path: &str) -> &'static str {
         "application/javascript; charset=utf-8"
     } else if path.ends_with(".css") {
         "text/css; charset=utf-8"
+    } else if path.ends_with(".ico") {
+        "image/x-icon"
     } else if path.ends_with(".svg") {
         "image/svg+xml"
     } else if path.ends_with(".png") {
