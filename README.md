@@ -123,6 +123,15 @@ HQCode's `crates/*` are fully parameterized (`TmuxNamespace`, `AuthConfig`, `Wor
 
 HQCode provides direct shell access and workspace file editing. Bind to `127.0.0.1` by default and expose remotely only behind TLS reverse proxy authentication, Tailscale, or a VPN. See [SECURITY.md](SECURITY.md).
 
+## Community & Contact
+
+- **Author QQ / WeChat**: `99739964`
+- **QQ Group**: `153376816` *(Scan with mobile QQ to join directly)*
+
+<p>
+  <img src="docs/assets/qq-group-153376816.png" alt="HQCode QQ Group 153376816" width="220" />
+</p>
+
 ## License
 
 [MIT](LICENSE) © 2026 HQCode Contributors

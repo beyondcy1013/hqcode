@@ -83,6 +83,15 @@ hqcode run "Codex Fast" -- codex
 - `hqcode use`：永久切换真实共享 `~/.codex` 或 `~/.claude` 配置。
 - `hqcode run`：备份真实配置 → 写入目标预设 → 原生拉起 CLI → 短暂启动稳定后自动恢复原配置。
 
+## 交流群与联系方式
+
+- **作者 QQ / 微信**：`99739964`
+- **交流 QQ 群**：`153376816`（手机 QQ 扫一扫直接加群）
+
+<p>
+  <img src="docs/assets/qq-group-153376816.png" alt="HQCode QQ 群 153376816" width="220" />
+</p>
+
 ## 安全与许可
 
 HQCode 提供直接 Shell 执行与工作区文件编辑能力，默认监听 `127.0.0.1:9900`；如需公网或跨设备远程访问，请务必配合 TLS 反向代理认证、Tailscale 或 VPN。详见 [SECURITY.md](SECURITY.md)。
