@@ -125,6 +125,7 @@ pub fn local_calendar_to_epoch_secs(
     if epoch == -1 && tm.tm_wday < 0 {
         return None;
     }
+    #[allow(clippy::useless_conversion)]
     Some(i64::from(epoch))
 }
 
@@ -162,7 +163,17 @@ mod tests {
     fn roundtrip_local_calendar_and_epoch() {
         let epoch = local_calendar_to_epoch_secs(2026, 7, 19, 14, 45, 12).unwrap();
         let parts = unix_epoch_to_local_parts(epoch).unwrap();
-        assert_eq!((parts.year, parts.month, parts.day, parts.hour, parts.minute, parts.second), (2026, 7, 19, 14, 45, 12));
+        assert_eq!(
+            (
+                parts.year,
+                parts.month,
+                parts.day,
+                parts.hour,
+                parts.minute,
+                parts.second
+            ),
+            (2026, 7, 19, 14, 45, 12)
+        );
         assert_eq!(format_local_datetime(epoch), "2026-07-19 14:45:12");
     }
 }

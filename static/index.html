@@ -8,24 +8,29 @@
   <link rel="stylesheet" href="/static/app.css" />
 </head>
 <body>
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
   <div id="login-view" class="login-shell hidden">
     <div class="login-card">
-      <div class="brand-row">
-        <span class="pulse-dot"></span>
-        <h1>HQCode</h1>
+      <div class="brand-row" style="justify-content: space-between;">
+        <div class="brand-row">
+          <span class="pulse-dot"></span>
+          <h1>HQCode</h1>
+        </div>
+        <button id="btn-lang-login" class="mini-btn" type="button">EN / 中</button>
       </div>
-      <p class="subtitle">Keep native Claude Code, Codex &amp; shell sessions alive in tmux.</p>
+      <p class="subtitle" data-i18n="subtitle">Keep native Claude Code, Codex &amp; shell sessions alive in tmux.</p>
       <form id="login-form">
         <label>
-          <span>Username</span>
+          <span data-i18n="username">Username</span>
           <input id="login-username" type="text" autocomplete="username" value="hqcode" required />
         </label>
         <label>
-          <span>Password</span>
-          <input id="login-password" type="password" autocomplete="current-password" placeholder="Check .hqcode-initial-password on first run" required />
+          <span data-i18n="password">Password</span>
+          <input id="login-password" type="password" autocomplete="current-password" data-i18n-placeholder="passwordPlaceholder" placeholder="Check .hqcode-initial-password on first run" required />
         </label>
         <p id="login-error" class="error-text hidden"></p>
-        <button type="submit" class="btn-primary full-width">Sign in to HQ</button>
+        <button type="submit" class="btn-primary full-width" data-i18n="signIn">Sign in to HQ</button>
       </form>
     </div>
   </div>
@@ -41,12 +46,17 @@
         <span id="workspace-path-pill" class="path-pill" title="Workspace root"></span>
       </div>
       <div class="topbar-right">
-        <button id="btn-open-diff" class="btn-ghost">
-          <span>Git Diff</span>
+        <span id="rss-pill" class="metric-pill hidden" title="Server RSS memory"></span>
+        <button id="btn-open-diff" class="btn-ghost" title="Ctrl+Shift+D">
+          <span data-i18n="gitDiff">Git Diff</span>
           <span id="diff-count-badge" class="badge hidden">0</span>
         </button>
-        <button id="btn-open-settings" class="btn-ghost">Presets &amp; Security</button>
-        <button id="btn-logout" class="btn-ghost">Logout</button>
+        <button id="btn-open-settings" class="btn-ghost" title="Presets &amp; Security">
+          <span class="desktop-only" data-i18n="presetsSecurity">Presets &amp; Security</span>
+          <span class="mobile-only">⚙</span>
+        </button>
+        <button id="btn-lang-toggle" class="btn-ghost" type="button">EN / 中</button>
+        <button id="btn-logout" class="btn-ghost" data-i18n="logout">Logout</button>
       </div>
     </header>
 
@@ -54,22 +64,26 @@
       <aside id="sidebar" class="sidebar">
         <section class="panel-section">
           <div class="section-header">
-            <span>Quick Launch</span>
+            <span data-i18n="quickLaunch">Quick Launch</span>
           </div>
           <div id="detected-agents" class="agent-grid"></div>
         </section>
 
         <section class="panel-section">
           <div class="section-header">
-            <span>Live Sessions</span>
-            <button id="btn-new-shell" class="mini-btn" title="New Shell Session">+ Shell</button>
+            <span data-i18n="liveSessions">Live Sessions</span>
+            <button id="btn-new-shell" class="mini-btn" title="New Shell Session" data-i18n="newShell">+ Shell</button>
+          </div>
+          <div class="search-wrap">
+            <input id="session-search-input" type="search" data-i18n-placeholder="searchPlaceholder" placeholder="Search session output (Ctrl+K)..." autocomplete="off" />
+            <div id="search-results" class="search-results hidden"></div>
           </div>
           <div id="session-list" class="session-list"></div>
         </section>
 
         <section class="panel-section flex-fill">
           <div class="section-header">
-            <span>Files</span>
+            <span data-i18n="files">Files</span>
             <button id="btn-refresh-files" class="mini-btn">↻</button>
           </div>
           <div id="file-breadcrumbs" class="breadcrumbs"></div>
@@ -78,20 +92,28 @@
       </aside>
 
       <main class="main-stage">
+        <div class="session-tab-bar">
+          <div id="session-tabs" class="session-tabs"></div>
+          <div class="tab-bar-status">
+            <span id="conn-pill" class="conn-pill hidden"></span>
+          </div>
+        </div>
+
         <div id="terminal-container" class="terminal-pane">
           <div id="empty-state" class="empty-state">
-            <h2>Your Coding Agents' Headquarters</h2>
-            <p>Launch a persistent tmux session from the sidebar. Close your browser or switch to your phone anytime without losing context.</p>
+            <h2 data-i18n="emptyTitle">Your Coding Agents' Headquarters</h2>
+            <p data-i18n="emptyDesc">Launch a persistent tmux session from the sidebar. Close your browser or switch to your phone anytime without losing context.</p>
           </div>
           <div id="xterm-host" class="xterm-host hidden"></div>
+          <button id="btn-jump-bottom" class="jump-bottom hidden" type="button" data-i18n="jumpBottom">↓ Jump to bottom</button>
         </div>
 
         <div id="editor-overlay" class="editor-overlay hidden">
           <div class="editor-header">
             <span id="editor-file-path" class="mono"></span>
             <div class="editor-actions">
-              <button id="btn-save-file" class="btn-primary">Save</button>
-              <button id="btn-close-editor" class="btn-ghost">Close</button>
+              <button id="btn-save-file" class="btn-primary" data-i18n="save">Save</button>
+              <button id="btn-close-editor" class="btn-ghost" data-i18n="close">Close</button>
             </div>
           </div>
           <textarea id="editor-textarea" class="editor-textarea" spellcheck="false"></textarea>
@@ -100,25 +122,27 @@
 
       <aside id="diff-drawer" class="diff-drawer hidden">
         <div class="drawer-header">
-          <div>
-            <strong>Git Review</strong>
+          <div class="drawer-title-group">
+            <strong data-i18n="gitReview">Git Review</strong>
             <span id="diff-branch-pill" class="branch-pill"></span>
+            <span id="diff-stat-pill" class="stat-pill hidden"></span>
           </div>
           <div class="drawer-actions">
+            <button id="btn-diff-all" class="mini-btn" data-i18n="allChanges">All Changes</button>
             <button id="btn-refresh-diff" class="mini-btn">↻</button>
             <button id="btn-close-diff" class="mini-btn">✕</button>
           </div>
         </div>
         <div class="commit-box">
-          <input id="commit-message-input" type="text" placeholder="Commit message..." />
-          <button id="btn-git-commit" class="btn-primary">Commit</button>
+          <input id="commit-message-input" type="text" data-i18n-placeholder="commitPlaceholder" placeholder="Commit message..." />
+          <button id="btn-git-commit" class="btn-primary" data-i18n="commit">Commit</button>
         </div>
         <div id="diff-file-list" class="diff-file-list"></div>
-        <pre id="diff-viewer" class="diff-viewer"></pre>
+        <div id="diff-viewer" class="diff-viewer"></div>
       </aside>
     </div>
 
-    <!-- Direct child of .hq-app so fixed positioning stays outside backdrop-filter/transform containers -->
+    <!-- Direct child of .hq-app so fixed/flex layout stays outside backdrop-filter/transform containers -->
     <div id="hq-mobile-keys" class="mobile-keys">
       <div class="mobile-key-row">
         <button class="mkey" data-key="esc">Esc</button>
@@ -127,12 +151,13 @@
         <button class="mkey" data-key="up">↑</button>
         <button class="mkey" data-key="down">↓</button>
         <button class="mkey accent" data-key="approve">y</button>
+        <button class="mkey" data-key="reject">n</button>
         <button class="mkey primary" data-key="enter">↵</button>
         <button class="mkey" data-action="diff">Diff</button>
       </div>
       <div class="mobile-compose-row">
-        <input id="mobile-quick-input" type="text" placeholder="Send steer / prompt..." autocomplete="off" />
-        <button id="btn-mobile-send" class="btn-primary">Send</button>
+        <input id="mobile-quick-input" type="text" data-i18n-placeholder="sendSteer" placeholder="Send steer / prompt..." autocomplete="off" />
+        <button id="btn-mobile-send" class="btn-primary" data-i18n="send">Send</button>
       </div>
     </div>
   </div>
@@ -140,12 +165,12 @@
   <div id="settings-modal" class="modal-backdrop hidden">
     <div class="modal-card">
       <div class="modal-header">
-        <h3>Presets &amp; Security</h3>
+        <h3 data-i18n="presetsSecurity">Presets &amp; Security</h3>
         <button id="btn-close-settings" class="mini-btn">✕</button>
       </div>
       <div class="modal-body">
         <section class="modal-section">
-          <h4>Model Presets (real config sync)</h4>
+          <h4 data-i18n="presetsTitle">Model Presets (real config sync)</h4>
           <div id="preset-list" class="preset-list"></div>
           <form id="preset-form" class="preset-form">
             <input id="preset-name" placeholder="Name (e.g. Claude Sonnet)" required />
@@ -156,15 +181,15 @@
             <input id="preset-model" placeholder="Model ID" required />
             <input id="preset-base-url" placeholder="Base URL (optional)" />
             <input id="preset-api-key" type="password" placeholder="API Key (optional)" />
-            <button type="submit" class="btn-primary">Save Preset</button>
+            <button type="submit" class="btn-primary" data-i18n="savePreset">Save Preset</button>
           </form>
         </section>
         <section class="modal-section">
-          <h4>Change Password</h4>
+          <h4 data-i18n="changePasswordTitle">Change Password</h4>
           <form id="password-form" class="preset-form">
             <input id="pw-current" type="password" placeholder="Current password" required />
             <input id="pw-new" type="password" placeholder="New password (min 8 chars)" required />
-            <button type="submit" class="btn-ghost">Update Password</button>
+            <button type="submit" class="btn-ghost" data-i18n="updatePassword">Update Password</button>
           </form>
         </section>
       </div>
@@ -173,6 +198,6 @@
 
   <script src="/static/vendor/xterm.js"></script>
   <script src="/static/vendor/xterm-addon-fit.js"></script>
-  <script src="/static/app.js"></script>
+  <script type="module" src="/static/app.js"></script>
 </body>
 </html>

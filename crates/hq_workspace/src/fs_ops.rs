@@ -394,7 +394,11 @@ pub async fn rename_entry(
     }
 
     let old_rel = relative_for_boundary(config, &canonical_src);
-    let kind = if canonical_src.is_dir() { "dir" } else { "file" };
+    let kind = if canonical_src.is_dir() {
+        "dir"
+    } else {
+        "file"
+    };
     fs::rename(&canonical_src, &destination)
         .await
         .context("failed to rename entry")?;
@@ -421,10 +425,8 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let root = std::env::temp_dir().join(format!(
-                "hq-ws-{label}-{}-{nonce}",
-                std::process::id()
-            ));
+            let root =
+                std::env::temp_dir().join(format!("hq-ws-{label}-{}-{nonce}", std::process::id()));
             std::fs::create_dir_all(root.join("project/sub")).unwrap();
             std::fs::write(root.join("project/hello.txt"), "world").unwrap();
             std::fs::write(root.join("outside.txt"), "secret").unwrap();
@@ -465,9 +467,7 @@ mod tests {
         assert!(file.editable);
         assert_eq!(file.content, "hi hqcode");
 
-        let renamed = rename_entry(&cfg, "sub/note.md", "note2.md")
-            .await
-            .unwrap();
+        let renamed = rename_entry(&cfg, "sub/note.md", "note2.md").await.unwrap();
         assert_eq!(renamed.path, "sub/note2.md");
         let file2 = read_utf8_file(&cfg, "sub/note2.md").await.unwrap();
         assert_eq!(file2.content, "hi hqcode");

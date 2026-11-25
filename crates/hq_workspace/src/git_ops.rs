@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -18,6 +19,8 @@ pub struct GitChangedFile {
     pub staged: bool,
     pub unstaged: bool,
     pub untracked: bool,
+    pub insertions: usize,
+    pub deletions: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -26,6 +29,8 @@ pub struct GitStatusSummary {
     pub repo_root: Option<String>,
     pub branch: String,
     pub files: Vec<GitChangedFile>,
+    pub insertions: usize,
+    pub deletions: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -119,7 +124,44 @@ fn decode_git_porcelain_line(line: &str) -> Option<GitChangedFile> {
         staged,
         unstaged,
         untracked,
+        insertions: 0,
+        deletions: 0,
     })
+}
+
+async fn collect_numstat(repo_root: &Path) -> HashMap<String, (usize, usize)> {
+    let mut stats: HashMap<String, (usize, usize)> = HashMap::new();
+    let has_head = run_git(repo_root, &["rev-parse", "--verify", "HEAD"])
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    let cmds: Vec<&[&str]> = if has_head {
+        vec![&["diff", "--numstat", "HEAD"]]
+    } else {
+        vec![&["diff", "--numstat"], &["diff", "--cached", "--numstat"]]
+    };
+
+    for args in cmds {
+        if let Ok(out) = run_git(repo_root, args).await
+            && out.status.success()
+        {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let mut parts = line.splitn(3, '\t');
+                let (Some(ins_s), Some(del_s), Some(file)) =
+                    (parts.next(), parts.next(), parts.next())
+                else {
+                    continue;
+                };
+                let ins = ins_s.trim().parse::<usize>().unwrap_or(0);
+                let del = del_s.trim().parse::<usize>().unwrap_or(0);
+                let entry = stats.entry(file.trim().to_string()).or_insert((0, 0));
+                entry.0 += ins;
+                entry.1 += del;
+            }
+        }
+    }
+    stats
 }
 
 pub async fn git_status(dir: &Path) -> Result<GitStatusSummary> {
@@ -129,16 +171,23 @@ pub async fn git_status(dir: &Path) -> Result<GitStatusSummary> {
             repo_root: None,
             branch: String::new(),
             files: Vec::new(),
+            insertions: 0,
+            deletions: 0,
         });
     };
 
     let branch_out = run_git(&repo_root, &["symbolic-ref", "--short", "HEAD"]).await?;
     let branch = if branch_out.status.success() {
-        String::from_utf8_lossy(&branch_out.stdout).trim().to_string()
+        String::from_utf8_lossy(&branch_out.stdout)
+            .trim()
+            .to_string()
     } else {
         let rev_out = run_git(&repo_root, &["rev-parse", "--short", "HEAD"]).await?;
         if rev_out.status.success() {
-            format!("detached@{}", String::from_utf8_lossy(&rev_out.stdout).trim())
+            format!(
+                "detached@{}",
+                String::from_utf8_lossy(&rev_out.stdout).trim()
+            )
         } else {
             "HEAD (unborn)".to_string()
         }
@@ -152,16 +201,29 @@ pub async fn git_status(dir: &Path) -> Result<GitStatusSummary> {
         );
     }
 
-    let files = String::from_utf8_lossy(&status_out.stdout)
+    let numstat = collect_numstat(&repo_root).await;
+    let mut total_ins = 0usize;
+    let mut total_del = 0usize;
+    let mut files: Vec<GitChangedFile> = String::from_utf8_lossy(&status_out.stdout)
         .lines()
         .filter_map(decode_git_porcelain_line)
         .collect();
+    for file in &mut files {
+        if let Some((ins, del)) = numstat.get(&file.path) {
+            file.insertions = *ins;
+            file.deletions = *del;
+            total_ins += *ins;
+            total_del += *del;
+        }
+    }
 
     Ok(GitStatusSummary {
         is_repo: true,
         repo_root: Some(repo_root.to_string_lossy().into_owned()),
         branch,
         files,
+        insertions: total_ins,
+        deletions: total_del,
     })
 }
 
@@ -415,10 +477,8 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let dir = std::env::temp_dir().join(format!(
-                "hq-git-{label}-{}-{nonce}",
-                std::process::id()
-            ));
+            let dir =
+                std::env::temp_dir().join(format!("hq-git-{label}-{}-{nonce}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             assert!(run_git(&dir, &["init"]).await.unwrap().status.success());
             assert!(
@@ -436,7 +496,13 @@ mod tests {
                     .success()
             );
             std::fs::write(dir.join("README.md"), "hello\n").unwrap();
-            assert!(run_git(&dir, &["add", "README.md"]).await.unwrap().status.success());
+            assert!(
+                run_git(&dir, &["add", "README.md"])
+                    .await
+                    .unwrap()
+                    .status
+                    .success()
+            );
             assert!(
                 run_git(&dir, &["commit", "-m", "init"])
                     .await
@@ -463,6 +529,14 @@ mod tests {
         let status = git_status(&repo.0).await.unwrap();
         assert!(status.is_repo);
         assert_eq!(status.files.len(), 2);
+        assert_eq!(status.insertions, 1);
+        assert_eq!(status.deletions, 0);
+
+        // Subdirectory inside git repo resolves the parent repo root.
+        std::fs::create_dir_all(repo.0.join("nested")).unwrap();
+        let nested_status = git_status(&repo.0.join("nested")).await.unwrap();
+        assert!(nested_status.is_repo);
+        assert_eq!(nested_status.files.len(), 2);
 
         let diff_readme = git_diff(&repo.0, Some("README.md")).await.unwrap();
         assert!(diff_readme.diff.contains("+world"));

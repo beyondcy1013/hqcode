@@ -184,7 +184,9 @@ pub fn tmux_missing_session_error(stderr: &str) -> bool {
 
 pub fn session_exists(ns: &TmuxNamespace, session_id: &str) -> bool {
     let mut cmd = isolated_tmux_command(ns, session_id);
-    cmd.arg("has-session").arg("-t").arg(ns.session_name(session_id));
+    cmd.arg("has-session")
+        .arg("-t")
+        .arg(ns.session_name(session_id));
     match bounded_command_output(cmd, TMUX_COMMAND_TIMEOUT, TMUX_SMALL_OUTPUT_LIMIT) {
         Ok(out) => out.status.success(),
         Err(_) => false,
@@ -329,7 +331,8 @@ fn run_tmux_new_session(
         let mut fallback = isolated_tmux_command(ns, session_id);
         build_tmux_args(&mut fallback);
         fallback.arg(&user_profile.shell).arg("-l");
-        let retry = bounded_command_output(fallback, TMUX_COMMAND_TIMEOUT, TMUX_SMALL_OUTPUT_LIMIT)?;
+        let retry =
+            bounded_command_output(fallback, TMUX_COMMAND_TIMEOUT, TMUX_SMALL_OUTPUT_LIMIT)?;
         if retry.status.success() {
             return Ok(());
         }
@@ -388,6 +391,15 @@ pub fn destroy_session(ns: &TmuxNamespace, session_id: &str) -> Result<()> {
     let mut kill_srv = isolated_tmux_command(ns, session_id);
     kill_srv.arg("kill-server");
     let _ = bounded_command_output(kill_srv, TMUX_COMMAND_TIMEOUT, TMUX_SMALL_OUTPUT_LIMIT);
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::geteuid() };
+        let sock_path =
+            std::path::PathBuf::from(format!("/tmp/tmux-{uid}")).join(ns.socket_name(session_id));
+        if !session_exists(ns, session_id) {
+            let _ = std::fs::remove_file(sock_path);
+        }
+    }
     Ok(())
 }
 

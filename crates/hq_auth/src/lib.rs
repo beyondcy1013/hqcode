@@ -81,8 +81,7 @@ impl AuthService {
 
         let credentials_path = data_dir.join(format!(".{}-credentials.json", config.file_prefix));
         let initial_pw_path = data_dir.join(format!(".{}-initial-password", config.file_prefix));
-        let credentials =
-            load_or_create_credentials(&credentials_path, &initial_pw_path, &config)?;
+        let credentials = load_or_create_credentials(&credentials_path, &initial_pw_path, &config)?;
 
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
@@ -148,9 +147,10 @@ impl AuthService {
             .context("verification semaphore closed")?;
         let password_owned = password.to_string();
         let hash_owned = creds.password_hash.clone();
-        let verified = tokio::task::spawn_blocking(move || verify_argon2(&password_owned, &hash_owned))
-            .await
-            .context("password verification task panicked")??;
+        let verified =
+            tokio::task::spawn_blocking(move || verify_argon2(&password_owned, &hash_owned))
+                .await
+                .context("password verification task panicked")??;
 
         if verified {
             let _ = fs::remove_file(self.initial_password_path());
@@ -169,7 +169,10 @@ impl AuthService {
         }
         let _guard = self.password_update_lock.lock().await;
         let current_username = self.username();
-        if !self.verify_login(&current_username, current_password).await? {
+        if !self
+            .verify_login(&current_username, current_password)
+            .await?
+        {
             bail!("current password is incorrect");
         }
         let username = new_username
@@ -178,10 +181,9 @@ impl AuthService {
             .unwrap_or(&current_username)
             .to_string();
         let new_pw = new_password.to_string();
-        let password_hash =
-            tokio::task::spawn_blocking(move || hash_argon2(&new_pw))
-                .await
-                .context("password hashing task panicked")??;
+        let password_hash = tokio::task::spawn_blocking(move || hash_argon2(&new_pw))
+            .await
+            .context("password hashing task panicked")??;
 
         let updated = StoredCredentials {
             version: 2,
@@ -336,8 +338,8 @@ fn hash_argon2(password: &str) -> Result<String> {
 }
 
 fn verify_argon2(password: &str, encoded_hash: &str) -> Result<bool> {
-    let parsed =
-        PasswordHash::new(encoded_hash).map_err(|e| anyhow::anyhow!("invalid password hash: {e}"))?;
+    let parsed = PasswordHash::new(encoded_hash)
+        .map_err(|e| anyhow::anyhow!("invalid password hash: {e}"))?;
     Ok(Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .is_ok())
@@ -362,10 +364,8 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let dir = std::env::temp_dir().join(format!(
-                "hq-auth-{label}-{}-{nonce}",
-                std::process::id()
-            ));
+            let dir = std::env::temp_dir()
+                .join(format!("hq-auth-{label}-{}-{nonce}", std::process::id()));
             fs::create_dir_all(&dir).unwrap();
             Self(dir)
         }
@@ -397,14 +397,22 @@ mod tests {
         assert!(!service.has_initial_password_pending());
 
         let token = service.issue_session_cookie("hqcode").unwrap();
-        assert_eq!(service.verify_session_cookie(&token).as_deref(), Some("hqcode"));
+        assert_eq!(
+            service.verify_session_cookie(&token).as_deref(),
+            Some("hqcode")
+        );
         assert!(service.verify_session_cookie("tampered.sig").is_none());
 
         service
             .change_password(&initial_pw, Some("admin"), "new-strong-password")
             .await
             .unwrap();
-        assert!(service.verify_login("admin", "new-strong-password").await.unwrap());
+        assert!(
+            service
+                .verify_login("admin", "new-strong-password")
+                .await
+                .unwrap()
+        );
         assert!(service.verify_local_token(service.local_api_token()));
         assert!(!service.verify_local_token("bad-token"));
     }

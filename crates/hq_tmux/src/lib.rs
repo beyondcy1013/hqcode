@@ -9,7 +9,7 @@ pub mod manager;
 pub mod tmux_cmd;
 
 pub use manager::{
-    CreateSessionRequest, SessionMetadata, SessionSnapshot, TerminalManager, TerminalOutputChunk,
-    TerminalStreamEvent, TerminalViewportSize,
+    CreateSessionRequest, SessionMetadata, SessionSearchMatch, SessionSnapshot, TerminalManager,
+    TerminalOutputChunk, TerminalStreamEvent, TerminalViewportSize,
 };
 pub use tmux_cmd::TmuxNamespace;

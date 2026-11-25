@@ -269,11 +269,7 @@ fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
         .encode_wide()
         .chain(Some(0))
         .collect();
-    let temporary_w: Vec<u16> = temporary
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
+    let temporary_w: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
     let replaced = unsafe {
         ReplaceFileW(
             destination_w.as_ptr(),
@@ -368,7 +364,10 @@ mod tests {
         fs::write(&path, b"old").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
         write_atomic(&path, b"new").unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o640);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
         assert_eq!(fs::read(&path).unwrap(), b"new");
     }
 
@@ -380,7 +379,10 @@ mod tests {
         let dir = TestDir::new("private");
         let secret = dir.0.join("nested").join("secret.json");
         write_private_json(&secret, &vec!["a", "b"]).unwrap();
-        assert_eq!(fs::metadata(&secret).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&secret).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let decoded: Vec<String> = read_private_json(&secret).unwrap();
         assert_eq!(decoded, vec!["a", "b"]);
 

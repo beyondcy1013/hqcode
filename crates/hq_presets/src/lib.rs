@@ -335,7 +335,9 @@ pub fn run_with_temporary_preset(
             FileBackup::capture(user_home.join(".codex/config.toml"))?,
             FileBackup::capture(user_home.join(".codex/auth.json"))?,
         ],
-        PresetKind::ClaudeApi => vec![FileBackup::capture(user_home.join(".claude/settings.json"))?],
+        PresetKind::ClaudeApi => vec![FileBackup::capture(
+            user_home.join(".claude/settings.json"),
+        )?],
     };
 
     apply_preset(user_home, preset)?;
@@ -387,10 +389,8 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let dir = std::env::temp_dir().join(format!(
-                "hq-presets-{label}-{}-{nonce}",
-                std::process::id()
-            ));
+            let dir = std::env::temp_dir()
+                .join(format!("hq-presets-{label}-{}-{nonce}", std::process::id()));
             fs::create_dir_all(&dir).unwrap();
             Self(dir)
         }
@@ -439,7 +439,10 @@ mod tests {
             &[
                 "/bin/sh".to_string(),
                 "-c".to_string(),
-                format!("grep -q 'gpt-5-mini' {}/.codex/config.toml", home.0.display()),
+                format!(
+                    "grep -q 'gpt-5-mini' {}/.codex/config.toml",
+                    home.0.display()
+                ),
             ],
             Duration::from_secs(2),
         )

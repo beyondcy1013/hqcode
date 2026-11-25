@@ -3,4 +3,5 @@
 *.log
 .DS_Store
 dist/
-Cargo.lock
+__pycache__/
+*.pyc

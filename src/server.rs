@@ -2,6 +2,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, RwLock},
+    time::Instant,
 };
 
 use anyhow::{Context, Result};
@@ -24,7 +25,7 @@ use hq_runtime_paths::resolve_current_user;
 use hq_tmux::{CreateSessionRequest, TerminalManager, TerminalStreamEvent, TmuxNamespace};
 use hq_workspace::{
     WorkspaceConfig, git_commit, git_diff, git_revert_file, git_status, list_entries,
-    read_utf8_file, rename_entry, write_utf8_file,
+    read_utf8_file, rename_entry, resolve_directory_path, write_utf8_file,
 };
 use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,7 @@ const STATIC_CACHE: &str = "no-cache, must-revalidate";
 #[derive(Clone)]
 pub struct AppState {
     pub version: String,
+    pub started_at: Instant,
     pub static_dir: PathBuf,
     pub workspace: Arc<RwLock<WorkspaceConfig>>,
     pub auth: AuthService,
@@ -86,7 +88,11 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (self.status, Json(serde_json::json!({ "error": self.message }))).into_response()
+        (
+            self.status,
+            Json(serde_json::json!({ "error": self.message })),
+        )
+            .into_response()
     }
 }
 
@@ -126,6 +132,7 @@ pub async fn serve(addr: SocketAddr, data_dir: PathBuf, workspace_dir: PathBuf) 
 
     let state = AppState {
         version: env!("CARGO_PKG_VERSION").to_string(),
+        started_at: Instant::now(),
         static_dir,
         workspace: Arc::new(RwLock::new(ws_config)),
         auth: auth.clone(),
@@ -139,7 +146,10 @@ pub async fn serve(addr: SocketAddr, data_dir: PathBuf, workspace_dir: PathBuf) 
         .with_context(|| format!("failed to bind {addr}"))?;
     let actual_addr = listener.local_addr()?;
 
-    info!("HQCode v{} listening on http://{}", state.version, actual_addr);
+    info!(
+        "HQCode v{} listening on http://{}",
+        state.version, actual_addr
+    );
     info!("workspace: {}", canonical_workspace.display());
     info!("data dir: {}", data_dir.display());
     if auth.has_initial_password_pending() {
@@ -172,6 +182,7 @@ pub fn build_router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/auth/logout", post(api_logout))
         .route("/api/auth/password", post(api_change_password))
+        .route("/api/system/info", get(api_system_info))
         .route("/api/agents/detected", get(api_detected_agents))
         .route("/api/entries", get(api_list_entries))
         .route("/api/file", get(api_read_file).put(api_save_file))
@@ -184,6 +195,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/terminal/sessions",
             get(api_list_sessions).post(api_create_session),
         )
+        .route("/api/terminal/sessions/search", get(api_search_sessions))
         .route(
             "/api/terminal/sessions/{id}",
             put(api_rename_session).delete(api_close_session),
@@ -191,7 +203,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/terminal/sessions/{id}/input", post(api_send_input))
         .route("/api/terminal/sessions/{id}/enter", post(api_send_enter))
         .route("/ws/terminal/{id}", get(ws_terminal))
-        .route("/api/presets", get(api_list_presets).post(api_upsert_preset))
+        .route(
+            "/api/presets",
+            get(api_list_presets).post(api_upsert_preset),
+        )
         .route("/api/presets/{id}", delete(api_delete_preset))
         .route("/api/presets/{id}/apply", post(api_apply_preset))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
@@ -209,11 +224,7 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn require_auth(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Response {
+async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let headers = request.headers();
     let is_loopback = request
         .extensions()
@@ -222,7 +233,9 @@ async fn require_auth(
         .unwrap_or(false);
 
     if is_loopback
-        && let Some(auth_hdr) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+        && let Some(auth_hdr) = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
         && let Some(token) = auth_hdr.strip_prefix("Bearer ")
         && state.auth.verify_local_token(token.trim())
     {
@@ -253,8 +266,10 @@ async fn serve_index(State(state): State<AppState>) -> Response {
         .unwrap_or_else(|| "<h1>HQCode</h1><p>Missing index.html</p>".to_string());
 
     let mut resp = Html(html).into_response();
-    resp.headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static(NO_STORE_CACHE));
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(NO_STORE_CACHE),
+    );
     resp
 }
 
@@ -282,7 +297,10 @@ async fn serve_static(
     let digest = hasher.finalize();
     let etag = format!(
         "\"{}\"",
-        digest.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     );
 
     if req_headers
@@ -511,16 +529,74 @@ async fn api_rename_path(
     Ok(Json(res))
 }
 
-async fn api_git_status(
-    State(state): State<AppState>,
-) -> ApiResult<Json<hq_workspace::GitStatusSummary>> {
-    let root = state
+fn read_linux_rss_kb() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kb_str = rest.split_whitespace().next()?;
+                return kb_str.parse::<u64>().ok();
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+async fn api_system_info(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let sessions = state.terminal.list_sessions();
+    let active_sessions = sessions.iter().filter(|s| s.alive).count();
+    Json(serde_json::json!({
+        "version": state.version,
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "rss_kb": read_linux_rss_kb(),
+        "uptime_secs": state.started_at.elapsed().as_secs(),
+        "active_sessions": active_sessions,
+    }))
+}
+
+fn resolve_git_target_dir(
+    state: &AppState,
+    session_id: Option<&str>,
+    path: Option<&str>,
+) -> std::result::Result<PathBuf, AppError> {
+    let cfg = state
         .workspace
         .read()
         .unwrap_or_else(|p| p.into_inner())
-        .root
         .clone();
-    let summary = git_status(&root)
+    if let Some(sid) = session_id.map(str::trim).filter(|s| !s.is_empty())
+        && let Some(cwd) = state.terminal.get_session_cwd(sid)
+        && let Ok(resolved) = resolve_directory_path(&cfg, &cwd.to_string_lossy())
+    {
+        return Ok(resolved);
+    }
+    if let Some(rel) = path.map(str::trim).filter(|s| !s.is_empty()) {
+        return resolve_directory_path(&cfg, rel).map_err(|e| AppError::bad_request(e.to_string()));
+    }
+    Ok(cfg.root)
+}
+
+#[derive(Deserialize, Default)]
+struct GitTargetQuery {
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+async fn api_git_status(
+    State(state): State<AppState>,
+    Query(query): Query<GitTargetQuery>,
+) -> ApiResult<Json<hq_workspace::GitStatusSummary>> {
+    let target =
+        resolve_git_target_dir(&state, query.session_id.as_deref(), query.path.as_deref())?;
+    let summary = git_status(&target)
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(Json(summary))
@@ -530,19 +606,19 @@ async fn api_git_status(
 struct DiffQuery {
     #[serde(default)]
     file: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
 }
 
 async fn api_git_diff(
     State(state): State<AppState>,
     Query(query): Query<DiffQuery>,
 ) -> ApiResult<Json<hq_workspace::GitDiffResponse>> {
-    let root = state
-        .workspace
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .root
-        .clone();
-    let diff = git_diff(&root, query.file.as_deref())
+    let target =
+        resolve_git_target_dir(&state, query.session_id.as_deref(), query.path.as_deref())?;
+    let diff = git_diff(&target, query.file.as_deref())
         .await
         .map_err(|e| AppError::bad_request(e.to_string()))?;
     Ok(Json(diff))
@@ -551,19 +627,22 @@ async fn api_git_diff(
 #[derive(Deserialize)]
 struct RevertFileRequest {
     file: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
 }
 
 async fn api_git_revert(
     State(state): State<AppState>,
     Json(payload): Json<RevertFileRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let root = state
-        .workspace
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .root
-        .clone();
-    git_revert_file(&root, &payload.file)
+    let target = resolve_git_target_dir(
+        &state,
+        payload.session_id.as_deref(),
+        payload.path.as_deref(),
+    )?;
+    git_revert_file(&target, &payload.file)
         .await
         .map_err(|e| AppError::bad_request(e.to_string()))?;
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -574,19 +653,22 @@ struct CommitRequest {
     message: String,
     #[serde(default)]
     files: Option<Vec<String>>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
 }
 
 async fn api_git_commit(
     State(state): State<AppState>,
     Json(payload): Json<CommitRequest>,
 ) -> ApiResult<Json<hq_workspace::GitCommitResult>> {
-    let root = state
-        .workspace
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .root
-        .clone();
-    let res = git_commit(&root, &payload.message, payload.files)
+    let target = resolve_git_target_dir(
+        &state,
+        payload.session_id.as_deref(),
+        payload.path.as_deref(),
+    )?;
+    let res = git_commit(&target, &payload.message, payload.files)
         .await
         .map_err(|e| AppError::bad_request(e.to_string()))?;
     Ok(Json(res))
@@ -597,10 +679,34 @@ async fn api_list_sessions(State(state): State<AppState>) -> Json<serde_json::Va
     Json(serde_json::json!({ "sessions": sessions }))
 }
 
+#[derive(Deserialize, Default)]
+struct SearchSessionsQuery {
+    #[serde(default)]
+    q: String,
+}
+
+async fn api_search_sessions(
+    State(state): State<AppState>,
+    Query(query): Query<SearchSessionsQuery>,
+) -> Json<serde_json::Value> {
+    let matches = state.terminal.search_sessions(&query.q);
+    Json(serde_json::json!({ "matches": matches }))
+}
+
 async fn api_create_session(
     State(state): State<AppState>,
-    Json(req): Json<CreateSessionRequest>,
+    Json(mut req): Json<CreateSessionRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    if let Some(raw_cwd) = req.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let cfg = state
+            .workspace
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let resolved = resolve_directory_path(&cfg, raw_cwd)
+            .map_err(|e| AppError::bad_request(e.to_string()))?;
+        req.cwd = Some(resolved.to_string_lossy().into_owned());
+    }
     let terminal = state.terminal.clone();
     let meta = tokio::task::spawn_blocking(move || terminal.create_session(req))
         .await
@@ -714,7 +820,11 @@ async fn handle_ws(
                     if chunk.seq <= snap.replay_end_seq {
                         continue;
                     }
-                    if sender.send(Message::Binary(chunk.bytes.into())).await.is_err() {
+                    if sender
+                        .send(Message::Binary(chunk.bytes.into()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -768,9 +878,10 @@ async fn handle_ws(
                                 .await;
                         }
                         WsClientMsg::Resize { cols, rows } => {
-                            let _ = state
-                                .terminal
-                                .resize_client(&session_id, client_id, cols, rows);
+                            let _ =
+                                state
+                                    .terminal
+                                    .resize_client(&session_id, client_id, cols, rows);
                         }
                     }
                 }
@@ -860,9 +971,10 @@ mod tests {
         let auth = AuthService::initialize(&data_dir, AuthConfig::for_app("hqcode")).unwrap();
         let state = AppState {
             version: "0.1.0".to_string(),
+            started_at: Instant::now(),
             static_dir: PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/static")),
             workspace: Arc::new(RwLock::new(WorkspaceConfig::new(PathBuf::from("/tmp")))),
-            auth,
+            auth: auth.clone(),
             terminal: TerminalManager::new(
                 TmuxNamespace::new("hqcode-srv-test"),
                 data_dir.join("sessions.json"),
@@ -887,6 +999,7 @@ mod tests {
         assert_eq!(health.status(), StatusCode::OK);
 
         let unauth = app
+            .clone()
             .oneshot(
                 HttpRequest::builder()
                     .uri("/api/entries")
@@ -896,6 +1009,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        let token = auth.issue_session_cookie("hqcode").unwrap();
+        let cookie = format!("hqcode_session={token}");
+
+        let sys = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/system/info")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sys.status(), StatusCode::OK);
+
+        let search = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/terminal/sessions/search?q=hello")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(search.status(), StatusCode::OK);
+
+        let git_st = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/git/status?path=.")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(git_st.status(), StatusCode::OK);
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

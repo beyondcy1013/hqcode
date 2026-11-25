@@ -46,6 +46,8 @@ pub enum TerminalStreamEvent {
     Closed,
 }
 
+const ACTIVE_OUTPUT_WINDOW_SECS: u64 = 5;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMetadata {
     pub id: String,
@@ -53,9 +55,24 @@ pub struct SessionMetadata {
     pub cwd: PathBuf,
     pub created_at: u64,
     pub last_used_at: u64,
+    #[serde(default)]
+    pub last_output_at: u64,
+    #[serde(default = "default_status_idle")]
+    pub status: String,
     pub manually_renamed: bool,
     pub user_name: String,
     pub alive: bool,
+}
+
+fn default_status_idle() -> String {
+    "idle".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SessionSearchMatch {
+    pub session_id: String,
+    pub session_name: String,
+    pub line: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,7 +153,10 @@ impl ViewportRegistry {
             rows: rows.clamp(6, 160),
         };
         self.clients.insert(client_id, size);
-        self.clients.values().max_by_key(|s| (s.cols, s.rows)).copied()
+        self.clients
+            .values()
+            .max_by_key(|s| (s.cols, s.rows))
+            .copied()
     }
 
     fn unregister(&mut self, client_id: u64) {
@@ -152,6 +172,7 @@ struct LiveSession {
     viewports: Mutex<ViewportRegistry>,
     backlog: Mutex<OutputBacklog>,
     next_seq: AtomicU64,
+    last_output_at: AtomicU64,
     broadcaster: broadcast::Sender<TerminalStreamEvent>,
     alive: AtomicBool,
     expected_shutdown: AtomicBool,
@@ -204,9 +225,13 @@ impl LiveSession {
             .master
             .try_clone_reader()
             .context("failed to clone PTY reader")?;
-        let writer = pair.master.take_writer().context("failed to take PTY writer")?;
+        let writer = pair
+            .master
+            .take_writer()
+            .context("failed to take PTY writer")?;
 
         let has_seed = initial_snapshot.is_some();
+        let initial_last_output = meta.last_output_at;
         let (broadcaster, _) = broadcast::channel(TERMINAL_OUTPUT_CHANNEL_CAPACITY);
         let session = Arc::new(Self {
             meta: RwLock::new(meta),
@@ -216,6 +241,7 @@ impl LiveSession {
             viewports: Mutex::new(ViewportRegistry::default()),
             backlog: Mutex::new(OutputBacklog::default()),
             next_seq: AtomicU64::new(0),
+            last_output_at: AtomicU64::new(initial_last_output),
             broadcaster,
             alive: AtomicBool::new(true),
             expected_shutdown: AtomicBool::new(false),
@@ -255,6 +281,9 @@ impl LiveSession {
                             session.suppress_redraw.store(false, Ordering::Relaxed);
                         }
                         let seq = session.next_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                        session
+                            .last_output_at
+                            .store(now_unix_secs(), Ordering::Relaxed);
                         let chunk = TerminalOutputChunk {
                             seq,
                             bytes: buffer[..n].to_vec(),
@@ -331,7 +360,9 @@ impl LiveSession {
                     pixel_width: 0,
                     pixel_height: 0,
                 })?;
-            let _ = self.broadcaster.send(TerminalStreamEvent::ViewportSize(size));
+            let _ = self
+                .broadcaster
+                .send(TerminalStreamEvent::ViewportSize(size));
         }
         Ok(())
     }
@@ -405,7 +436,8 @@ impl TerminalManager {
         let mut live_list = Vec::new();
         for mut meta in stored {
             if session_exists(&self.ns, &meta.id) {
-                let snapshot = capture_initial_snapshot(&self.ns, &meta.id, DEFAULT_SNAPSHOT_LINES).ok();
+                let snapshot =
+                    capture_initial_snapshot(&self.ns, &meta.id, DEFAULT_SNAPSHOT_LINES).ok();
                 match LiveSession::attach(&self.ns, meta.clone(), snapshot) {
                     Ok(live) => {
                         meta.alive = true;
@@ -440,19 +472,79 @@ impl TerminalManager {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         let live_map = self.sessions.read().unwrap_or_else(|p| p.into_inner());
+        let now = now_unix_secs();
         let mut out = Vec::with_capacity(stored.len());
         for mut meta in stored {
             if let Some(live) = live_map.get(&meta.id) {
                 let current = live.meta.read().unwrap_or_else(|p| p.into_inner()).clone();
                 meta = current;
                 meta.alive = live.alive.load(Ordering::SeqCst);
+                meta.last_output_at = live.last_output_at.load(Ordering::Relaxed);
+                meta.status = if !meta.alive {
+                    "exited".to_string()
+                } else if meta.last_output_at > 0
+                    && now.saturating_sub(meta.last_output_at) <= ACTIVE_OUTPUT_WINDOW_SECS
+                {
+                    "active".to_string()
+                } else {
+                    "idle".to_string()
+                };
             } else {
                 meta.alive = false;
+                meta.status = "exited".to_string();
             }
             out.push(meta);
         }
-        out.sort_by(|a, b| b.last_used_at.cmp(&a.last_used_at));
+        out.sort_by_key(|a| std::cmp::Reverse(a.last_used_at));
         out
+    }
+
+    pub fn get_session_cwd(&self, session_id: &str) -> Option<PathBuf> {
+        self.get_live(session_id).ok().map(|live| {
+            live.meta
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .cwd
+                .clone()
+        })
+    }
+
+    pub fn search_sessions(&self, query: &str) -> Vec<SessionSearchMatch> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        let needle = trimmed.to_ascii_lowercase();
+        let live_map = self.sessions.read().unwrap_or_else(|p| p.into_inner());
+        let mut matches = Vec::new();
+        for (session_id, live) in live_map.iter() {
+            let session_name = live
+                .meta
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .name
+                .clone();
+            let bytes = live
+                .backlog
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .snapshot();
+            let text = strip_ansi_sequences(&String::from_utf8_lossy(&bytes));
+            for line in text.lines().rev() {
+                let clean = line.trim();
+                if !clean.is_empty() && clean.to_ascii_lowercase().contains(&needle) {
+                    matches.push(SessionSearchMatch {
+                        session_id: session_id.clone(),
+                        session_name: session_name.clone(),
+                        line: clean.chars().take(180).collect(),
+                    });
+                    if matches.len() >= 50 {
+                        return matches;
+                    }
+                }
+            }
+        }
+        matches
     }
 
     pub fn create_session(&self, req: CreateSessionRequest) -> Result<SessionMetadata> {
@@ -467,11 +559,7 @@ impl TerminalManager {
             bail!("workspace directory does not exist: {}", cwd.display());
         }
 
-        let id = format!(
-            "s{:x}{:04x}",
-            now_unix_secs(),
-            rand::random::<u16>()
-        );
+        let id = format!("s{:x}{:04x}", now_unix_secs(), rand::random::<u16>());
         let dir_label = cwd
             .file_name()
             .and_then(|n| n.to_str())
@@ -493,6 +581,8 @@ impl TerminalManager {
             cwd: cwd.clone(),
             created_at: now,
             last_used_at: now,
+            last_output_at: now,
+            status: "active".to_string(),
             manually_renamed: req.name.is_some(),
             user_name: self.user_profile.name.clone(),
             alive: true,
@@ -592,7 +682,13 @@ impl TerminalManager {
         }
     }
 
-    pub fn resize_client(&self, session_id: &str, client_id: u64, cols: u16, rows: u16) -> Result<()> {
+    pub fn resize_client(
+        &self,
+        session_id: &str,
+        client_id: u64,
+        cols: u16,
+        rows: u16,
+    ) -> Result<()> {
         let live = self.get_live(session_id)?;
         live.resize_client(client_id, cols, rows)
     }
@@ -612,6 +708,43 @@ fn now_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn strip_ansi_sequences(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if ch != '\r' {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -634,8 +767,12 @@ mod tests {
     }
 
     #[test]
-    fn create_send_rename_and_close_session() {
-        if std::process::Command::new("tmux").arg("-V").output().is_err() {
+    fn create_send_rename_search_and_close_session() {
+        if std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_err()
+        {
             return;
         }
         let dir = std::env::temp_dir().join(format!("hq-mgr-{}", std::process::id()));
@@ -657,13 +794,33 @@ mod tests {
             .create_session(CreateSessionRequest {
                 cwd: Some("/tmp".to_string()),
                 name: None,
-                startup_command: Some("echo MANAGER_OK".to_string()),
+                startup_command: Some("echo MANAGER_SEARCH_TOKEN_99".to_string()),
             })
             .unwrap();
         guard.created_ids.push(meta.id.clone());
 
+        assert_eq!(mgr.get_session_cwd(&meta.id), Some(PathBuf::from("/tmp")));
+
         let renamed = mgr.rename_session(&meta.id, "dev-main").unwrap();
         assert_eq!(renamed.name, "dev-main");
+
+        // Wait briefly for startup command output to enter PTY backlog.
+        let mut found = Vec::new();
+        for _ in 0..20 {
+            found = mgr.search_sessions("MANAGER_SEARCH_TOKEN_99");
+            if !found.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(!found.is_empty());
+        assert_eq!(found[0].session_id, meta.id);
+        assert!(mgr.search_sessions("   ").is_empty());
+
+        let listed = mgr.list_sessions();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].last_output_at > 0);
+        assert_eq!(listed[0].status, "active");
 
         let (cid, snap) = mgr.subscribe(&meta.id).unwrap();
         assert!(snap.alive);

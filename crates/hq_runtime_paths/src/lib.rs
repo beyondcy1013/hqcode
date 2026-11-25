@@ -176,7 +176,10 @@ fn is_login_user_profile(profile: &UserProfile) -> bool {
         .and_then(OsStr::to_str)
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
-    !matches!(shell_name.as_str(), "nologin" | "false" | "sync" | "shutdown" | "halt")
+    !matches!(
+        shell_name.as_str(),
+        "nologin" | "false" | "sync" | "shutdown" | "halt"
+    )
 }
 
 #[cfg(unix)]
